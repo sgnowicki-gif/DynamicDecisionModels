@@ -212,14 +212,17 @@ class RoadNetwork():
         self.check_big_matrix()
 
         if self.time % 60 == 0:
-            print(f"Took time {time.time() - self.start_sim_time}")
+            print(f"Took time {time.time() - self.last_update_time}")
             print(f"At time {int(self.time / 60)}:00")
             print(f"Completed {self.time - self.start:.2f} minutes ({(self.time - self.start) / (self.end - self.start):.2f}% completed)")
             print(f"Completed {self.total_trips} with {self.slowdown_time} total slowdown minutes")
             print(f"Total Demand = {np.sum(self.big_matrix)}")
 
+            self.last_update_time = time.time()
+
     def run_simulation(self):
         self.start_sim_time = time.time()
+        self.last_update_time = self.start_sim_time
         while self.time < self.end:
             self.update()
         print(f"Simulation Complete in {time.time() - self.start_sim_time:.2f}")
