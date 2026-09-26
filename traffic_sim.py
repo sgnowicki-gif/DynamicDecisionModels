@@ -45,7 +45,7 @@ class RoadNetwork():
         self.big_matrix = np.zeros((len(links), end_hour - start_hour), dtype = int)
 
         self.link_to_row = {
-            link_idx: idx for idx, link_idx in enumerate(links)
+            link: idx for idx, link in enumerate(links)
         }
 
         self.row_to_link = {
@@ -63,6 +63,9 @@ class RoadNetwork():
 
         #Creates a quick path lookup to speed up computation
         self.path_lookup = self.build_path_lookup()
+
+        #Creates a capacity lookup array instead of recomputing
+        self.capacity_array = np.array(capacity)
 
         #Creates a dictionary which stores an object which can get how long until an agent starts a trip between two nodes
         self.agent_creator = {
@@ -106,20 +109,16 @@ class RoadNetwork():
         path_lookup = {}
 
         for o in self.graph.nodes:
-            for d in self.graph.nodes:
-                if o == d:
-                    continue
+            paths = nx.single_source_dijkstra_path(
+                self.graph,
+                o,
+                weight = 'length'
+            )
 
-                path = nx.shortest_path(
-                    self.graph,
-                    source = o,
-                    target = d,
-                    weight = 'length'
-                )
-
-                link_path = list(zip(path[:-1], path[1:]))
-
-                path_lookup[(o,d)] = link_path
+            for d, path in paths.items():
+                if o != d:
+                    path_lookup[(o, d)] = list(zip(path[:-1],path[1:]))
+            
         return path_lookup
 
     def add_new_driver(self, o, d, start_time):
@@ -143,28 +142,26 @@ class RoadNetwork():
 
     def check_big_matrix(self):
         #Checks big matrix for places which are exceeding capacity
-        capacities = np.array([self.link_capacity[self.row_to_link[i]] for i in range(len(self.big_matrix))])
-        exceeds = self.big_matrix > capacities[:, None]
+        current_col = int(self.time - self.start)
+
+        exceeds = self.big_matrix[:, current_col] > self.capacity_array
 
         #If no where is exceeding just stops
         if not exceeds.any():
             return
 
-        #Gets all link indexes and times where exceedance is happening
-        link_idxs, times = np.where(exceeds)
-
         #Loops through all these links to find all paths which go through congestion
-        for link_idx, t in zip(link_idxs, times):
+        for link_idx in np.flatnonzero(exceeds):
             target_link = self.row_to_link[link_idx]
 
             #Finds how large the exceedance is and computes a slowdown factor
-            cur_demand = self.big_matrix[link_idx, t]
+            cur_demand = self.big_matrix[link_idx, current_col]
             capacity = self.link_capacity[target_link]
             extra = cur_demand - capacity
             slowdown_factor = self.get_slowdown_factor(extra)
 
             #Finds all paths which will be affected by the slowdown
-            matching_paths = [i for i , path in enumerate(self.current_paths) if any(link == target_link and start <= t < end for link, start, end in path)]
+            matching_paths = [i for i , path in enumerate(self.current_paths) if any(link == target_link and start <= self.time < end for link, start, end in path)]
 
             #Now updates big matrix and current paths
             for idx in matching_paths:
@@ -196,11 +193,12 @@ class RoadNetwork():
             self.current_paths = [path for path in self.current_paths if path[-1][2] > self.time]
             self.total_trips += old_length - len(self.current_paths)
 
-        self.time_left = {k: v - 1 for k, v in self.time_left.items()}
+        for k in self.time_left:
+            self.time_left[k] -= 1
         update_od_pairs = [k for k, v in self.time_left.items() if v < 1]
         for n1, n2 in update_od_pairs:
             self.add_new_driver(n1, n2, self.time)
-            cur_hour = int(self.time / 60)
+            cur_hour = self.time // 60
             new_time = self.agent_creator[(n1, n2, cur_hour)].next_arrival()
             inter_minute_time = 0
             while new_time < 1 and inter_minute_time < 1:
@@ -208,12 +206,13 @@ class RoadNetwork():
                 inter_minute_time += new_time
                 new_time = self.agent_creator[(n1, n2, cur_hour)].next_arrival()
             self.time_left[(n1, n2)] = new_time
-    
+
+        self.affected_paths = set()
         self.check_big_matrix()
 
         if self.time % 60 == 0:
             print(f"Took time {time.time() - self.last_update_time}")
-            print(f"At time {int(self.time / 60)}:00")
+            print(f"At time {self.time // 60}:00")
             print(f"Completed {self.time - self.start:.2f} minutes ({(self.time - self.start) / (self.end - self.start):.2f}% completed)")
             print(f"Completed {self.total_trips} with {self.slowdown_time} total slowdown minutes")
             print(f"Total Demand = {np.sum(self.big_matrix)}")
@@ -231,7 +230,7 @@ class RoadNetwork():
     def reset(self):
         self.slowdown_time = 0
         self.time = self.start
-        self.time_left = {(n1, n2): v.next_arrival() for (n1, n2, h), v in self.agent_creator if h == int(self.start / 60)}
+        self.time_left = {(n1, n2): v.next_arrival() for (n1, n2, h), v in self.agent_creator if h ==self.start // 60}
 
 
 
