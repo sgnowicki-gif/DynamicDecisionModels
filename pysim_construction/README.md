@@ -1,45 +1,3 @@
-# pysim_construction — bare PySim with construction closures (DDM only), version 2
-
-A specialised copy of the standalone PySim loading pass for
-Eli's Dynamic Decision Models project. It replaces Sebastian's
-`traffic_sim.py` for DDM use only. It is NOT a general DTALite
-replacement, and it must not be overlaid onto the standalone
-`pysim` tree.
-
-## Breaking changes vs v1 — read this first
-
-Version 2 is NOT drop-in compatible with version 1 of this
-package, even though the folder name (`pysim_construction`) and
-the function name (`run_pysim_construction`) are the same. The
-v1 zip on disk is untouched; this is its successor, not a patch
-over it.
-
-- Inputs are exactly four bare CSV files (below). The v1
-  DTALite-format inputs (demand file list, zone file, link-type
-  file, scenario settings, DTASettings.txt, demand/vehicle-type
-  files, emission-rate file) are no longer read. If old files
-  are still sitting in the input directory they are ignored,
-  not read and not rejected — but do not rely on them: nothing
-  in them affects a v2 run.
-- Emissions are removed. `emissions_full.py` is deleted, there
-  is no `emissions` argument and no `--emissions` CLI flag. An
-  old v1 call with `emissions=True` fails with a clear
-  `TypeError` (unexpected keyword argument), it is not silently
-  ignored.
-- Outputs are only three files (below). `outputs.py` is deleted:
-  no `output_agent.csv`, `output_trip.csv`,
-  `output_LinkTDMOE.csv` or `output_LinkMOE.csv` is written.
-  The internal link MOE arrays are still built and used for
-  travel-time lookups and shortest paths; only the writers are
-  gone, so dropping them cannot change traffic results.
-- The result dict no longer contains `emissions` or the four
-  old output paths. `outputs` has exactly three keys: `excess`,
-  `excess_summary`, `construction_projects`.
-- Clean extraction required. If you unzip v2 over an existing v1
-  package folder, the deleted v1 files (`emissions_full.py`,
-  `outputs.py`, plus any `__pycache__` entries) are left behind
-  as orphans. Extract v2 into a new, empty directory instead.
-
 ## Quick start
 
 ```python
@@ -96,8 +54,6 @@ python -m pysim_construction.run <input_dir> <output_dir>
     [--construction <file>] [--flow-model 2] [--seed 100]
 ```
 
-There is no `--emissions` flag.
-
 ## Bare input schema — exactly four files
 
 ### 1. input_node.csv
@@ -123,25 +79,6 @@ Required: `from_node_id`, `to_node_id`, `length`,
 `number_of_lanes`, `speed_limit`,
 `lane_capacity_in_vhc_per_hour` (`lane_cap` is accepted as an
 alias; the long name is primary and wins if both are present).
-Optional, with defaults: `jam_density` (180),
-`wave_speed` (12); the aliases `jam_density_in_vhc_pmpl` and
-`wave_speed_in_mph` are also accepted. A missing `length`
-defaults to 1.0, as in v1.
-
-Dropped columns, all ignored if present, never rejected:
-
-- `direction`: one row is always exactly one directed link,
-  from -> to as written. No reverse link is created and no link
-  is reversed. A file with only 1 -> 2 does NOT create 2 -> 1.
-- `link_type`: hardcoded to 1, type code `"f"` (Freeway),
-  bias 1.0, capacity adjustment 1.0. Verified: Sioux Falls is
-  76/76 link_type 1 Freeway with bias 1.0, so hardcoding `"f"`
-  preserves its merge logic, and that logic never triggers on
-  Sioux Falls (no node has exactly one outgoing link).
-- `mode_code`, `geometry`, `link_type_name` and every other
-  extra column: ignored. Every row is a vehicle link (bare
-  files have no walk/transit/bike rows; Sioux Falls `mode` is
-  empty).
 
 Fail loud on: missing from/to node, a from/to node that is not
 in the node file, a duplicate directed link, `number_of_lanes`
@@ -162,21 +99,6 @@ accepted for the OD columns: `from_origin_node_id` for origin,
 (the zone dict is generated internally from the nodes, in node
 file order).
 
-Agents MUST be pathless. If a `path_node_sequence` column is
-present and non-empty for any agent, the run fails loud with
-"bare v2 agents must be pathless" — a path is never silently
-ignored. A duplicate `agent_id` fails loud. A departure below 0
-fails loud.
-
-Hardcoded per agent (the v1 defaults): `demand_type` 1,
-`vehicle_type` 1, PCE 1, `information_type` 1, value of time 10,
-age 5. With `information_type` 1, `info_updating_flag` stays
-False, so every reroute is a free-flow shortest path excluding
-barred links — deterministic, as a DDM reward needs. No RNG
-draw is made for information class or age in bare v2, so
-`random_seed` has no effect on results; that is stated honestly
-here rather than left as a silent no-op.
-
 Simulation window: start = minimum departure, end = maximum
 departure, horizon = end + 300 (the v1 construction horizon
 rule, including the multi-day cap lifted to 1,000,000 minutes
@@ -196,21 +118,6 @@ and duration on every row of the project (differing values fail
 loud). See the closure semantics below; the fail-loud rules are
 the same as v1 (missing file/column, unknown link, duplicate
 project-link row, duration <= 0, non-numeric times).
-
-## Dropped files and code
-
-Never read, never required, ignored if present in the input
-directory (an old input directory still runs, with identical
-results): `DTASettings.txt`, `input_scenario_settings.csv`,
-`input_link_type.csv`, `input_zone.csv`,
-`input_activity_location.csv`, `input_demand_type.csv`,
-`optional_vehicle_type.csv`, `optional_vehicle_emission_rate.csv`,
-`input_demand_file_list.csv`. There is no signal feature:
-`signal_model` is hardcoded to 0. PySim does not read
-node-control or movement files, and Sioux Falls has no signals
-defined anyway, so nothing is lost by not adding one. There are
-no ramps (every link is type `"f"`), no vehicle or demand types,
-and no zones file: zone = node, generated internally.
 
 ## Closure semantics (project-level sync, unchanged from v1)
 
