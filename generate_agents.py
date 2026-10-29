@@ -5,8 +5,8 @@ import random
 
 rng = random.Random(100)
 
-example_start = datetime(2026, 10, 1, 0,0)
-example_end = datetime(2026, 10, 20, 0, 0)
+project_start = datetime(2026, 6, 1, 0,0)
+project_end = datetime(2026, 9, 30, 0, 0)
 
 full_demand = pd.read_excel('SiouxFalls_net_DDMproj.xlsx', sheet_name = 'Full Demand')
 
@@ -40,4 +40,4 @@ def generate_agents(start_time, end_time):
     outputDf.to_csv('input_agent.csv')
     print('Completed !!')
 
-generate_agents(example_start, example_end)
+generate_agents(project_start, project_end)
