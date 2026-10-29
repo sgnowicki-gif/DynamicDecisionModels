@@ -1,10 +1,13 @@
-# Run one DTALite loading pass with construction closures, mirroring
-# the v2 flow: settings -> scenario -> input files -> iteration-0
-# path assignment -> capture of the pre-closure original path ->
-# network loading with barred-link reroutes -> emission post-pass
-# (if any) -> the four v2 output files unchanged, plus the three
-# construction output files. The input directory is used as given;
-# it is never written to, and it does not need any particular name.
+# Run one bare loading pass with construction closures: read the
+# four bare input files, assign iteration-0 paths, capture the
+# pre-closure original path, run network loading with barred-link
+# reroutes, then write only the three construction output files.
+# The input directory is used as given; it is never written to,
+# and it does not need any particular name. There is no emissions
+# post-pass and no agent/trip/link output in bare v2, but the
+# internal link MOE arrays are still built and used, exactly as
+# before, for travel_time_by_min and the prevailing-time shortest
+# paths. Dropping the output writers does not touch that code.
 import os
 import sys
 
@@ -14,23 +17,17 @@ from .construction_outputs import (
 from .cpp import ProgramStop
 from .loading import Simulator
 from .network import World
-from .outputs import write_agent_files, write_link_moe, write_link_tdmoe
 
 
-def run_loading_construction(input_dir, output_dir, emissions=False,
-                             construction_file=None):
-    world = World(input_dir)
-    world.emission_mode = "full" if emissions else "off"
-    world.emission_output_flag = 2 if emissions else 0
+def run_loading_construction(input_dir, output_dir,
+                             construction_file=None, flow_model=2,
+                             random_seed=100):
+    world = World(input_dir, flow_model=flow_model,
+                  random_seed=random_seed)
     if world.flow_model not in (1, 2, 3):
         raise ProgramStop(
             "pysim implements the queue-based flow models 1/2/3; "
-            "traffic_flow_model=%d (0=BPR, 4=car-following) is out of scope"
-            % world.flow_model)
-    if world.num_iterations != 0:
-        raise ProgramStop(
-            "pysim implements a single loading pass; the scenario requests "
-            "%d assignment iterations" % (world.num_iterations + 1))
+            "traffic_flow_model=%s is out of scope" % (world.flow_model,))
     world.read_inputs()
     # Resolve the construction file before any simulation runs.
     # Default: input_dir/construction_projects.csv. An explicit
@@ -50,10 +47,10 @@ def run_loading_construction(input_dir, output_dir, emissions=False,
     sim = Simulator(world, construction=manager)
     sim.assign_paths_iteration_zero()
     # Capture the pre-closure original path for every vehicle with
-    # a path, before loading and before any closure reroute: the
-    # preassigned input path, or for pathless agents the free-flow
-    # shortest path just assigned on the full network. FFTT values
-    # are already set by Link.setup_moe at read time.
+    # a path, before loading and before any closure reroute: for
+    # bare pathless agents this is the free-flow shortest path
+    # just assigned on the full network. FFTT values are already
+    # set by Link.setup_moe at read time.
     for agent_id in world.vehicle_order:
         veh = world.vehicles[agent_id]
         if veh.node_size >= 2 and veh.link_ary is not None:
@@ -64,30 +61,7 @@ def run_loading_construction(input_dir, output_dir, emissions=False,
                 total += float(world.links[link_no].fftt)
             veh.closed_fftt = total
     sim.network_loading()
-    if emissions:
-        try:
-            from .emissions_full import calculate_emissions_full
-        except ImportError as exc:
-            if getattr(exc, "name", "") in (
-                    "pysim_construction.emissions_full",
-                    "emissions_full"):
-                raise ProgramStop(
-                    "emissions=True but emissions_full.py is not "
-                    "present; refusing to fall back to off")
-            raise
-        calculate_emissions_full(world)
-        if not getattr(world, "emissions_computed", False):
-            raise ProgramStop(
-                "emissions_full.py did not set "
-                "world.emissions_computed=True (contract breach); "
-                "refusing to write agent emissions from unset slots")
     os.makedirs(output_dir, exist_ok=True)
-    write_agent_files(world,
-                      os.path.join(output_dir, "output_agent.csv"),
-                      os.path.join(output_dir, "output_trip.csv"))
-    write_link_tdmoe(world, os.path.join(output_dir, "output_LinkTDMOE.csv"),
-                     day_no=world.num_iterations + 1)
-    write_link_moe(world, os.path.join(output_dir, "output_LinkMOE.csv"))
     summary = write_excess_files(
         world, os.path.join(output_dir, "output_excess_travel_time.csv"),
         os.path.join(output_dir, "output_excess_summary.csv"))
@@ -96,21 +70,50 @@ def run_loading_construction(input_dir, output_dir, emissions=False,
     return world, manager, summary
 
 
+def _flag_value(argv, flag, default=None):
+    if flag in argv:
+        idx = argv.index(flag)
+        if idx + 1 < len(argv):
+            return argv[idx + 1]
+    return default
+
+
 def main(argv):
     if len(argv) < 3:
         print("usage: python -m pysim_construction.run <input_dir> "
-              "<output_dir> [--emissions] [--construction <file>]")
+              "<output_dir> [--construction <file>] "
+              "[--flow-model 2] [--seed 100]")
         return 2
     input_dir = argv[1]
     output_dir = argv[2]
-    emissions = "--emissions" in argv[3:]
-    construction_file = None
-    if "--construction" in argv[3:]:
-        idx = argv.index("--construction")
-        if idx + 1 < len(argv):
-            construction_file = argv[idx + 1]
-    run_loading_construction(input_dir, output_dir, emissions=emissions,
-                             construction_file=construction_file)
+    rest = argv[3:]
+    # Unknown flags fail loud instead of being silently ignored:
+    # in particular --emissions must not look accepted when the
+    # package has no emissions support at all.
+    known = {"--construction", "--flow-model", "--seed"}
+    i = 0
+    while i < len(rest):
+        token = rest[i]
+        if token.startswith("--") and token not in known:
+            print("error: unknown option %s (there is no --emissions "
+                  "flag in bare v2)" % token)
+            return 2
+        if token in known:
+            i += 2
+        else:
+            i += 1
+    construction_file = _flag_value(rest, "--construction")
+    flow_model = _flag_value(rest, "--flow-model", "2")
+    seed = _flag_value(rest, "--seed", "100")
+    try:
+        flow_model = int(flow_model)
+        seed = int(seed)
+    except ValueError:
+        print("error: --flow-model and --seed must be integers")
+        return 2
+    run_loading_construction(input_dir, output_dir,
+                             construction_file=construction_file,
+                             flow_model=flow_model, random_seed=seed)
     return 0
 
 

@@ -1,6 +1,7 @@
 # Low-level C++ fidelity helpers: float32 arithmetic, the truncating epsilon
-# comparators (Utility.cpp:206-225), the per-link LCG, CCSVParser and the
-# DTASettings INI reader (mfc_compat GetPrivateProfileString semantics).
+# comparators (Utility.cpp:206-225), the per-link LCG and CCSVParser.
+# (The DTASettings INI reader was removed in bare v2: no settings file
+# is read, so there is nothing for it to parse.)
 import re
 
 import numpy as np
@@ -217,46 +218,3 @@ class CsvParser:
         if value is None:
             return False, None
         return True, value
-
-
-class IniFile:
-    # DTASettings.txt via the Linux GetPrivateProfileString shim
-    # (mfc_compat.h:238): case-sensitive section/key, trimmed, first hit wins.
-    def __init__(self, path):
-        self.values = {}
-        try:
-            with open(path, "r", newline="") as fh:
-                lines = fh.read().split("\n")
-        except OSError:
-            lines = []
-        section = ""
-        for raw in lines:
-            text = raw.strip()
-            if not text or text[0] in ";#":
-                continue
-            if text.startswith("[") and text.endswith("]"):
-                section = text[1:-1].strip()
-                continue
-            eq = text.find("=")
-            if eq == -1:
-                continue
-            key = text[:eq].strip()
-            if (section, key) not in self.values:
-                self.values[(section, key)] = text[eq + 1:].strip()
-
-    def get_int(self, section, key, default):
-        text = self.values.get((section, key))
-        if text is None:
-            return default
-        value = parse_int(text)
-        return default if value is None else value
-
-    def get_float(self, section, key, default):
-        text = self.values.get((section, key))
-        if text is None:
-            return f32(default)
-        value = parse_float(text)
-        return f32(default) if value is None else f32(value)
-
-    def get_str(self, section, key, default):
-        return self.values.get((section, key), default)

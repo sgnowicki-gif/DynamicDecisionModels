@@ -7,7 +7,7 @@ from collections import deque
 
 import numpy as np
 
-from .cpp import (CsvParser, IniFile, LinkRNG, ProgramStop, VehicleGenerationRng,
+from .cpp import (CsvParser, LinkRNG, ProgramStop, VehicleGenerationRng,
                   WellRng, f32, parse_line)
 
 MAX_LINK_NO = 65530  # DTALite.h, non-Windows branch
@@ -229,45 +229,39 @@ class DemandType:
 
 
 class World:
-    def __init__(self, input_dir):
+    def __init__(self, input_dir, flow_model=2, random_seed=100):
+        if flow_model not in (1, 2, 3):
+            raise ProgramStop(
+                "pysim implements the queue-based flow models 1/2/3; "
+                "traffic_flow_model=%s is out of scope" % (flow_model,))
         self.dir = input_dir
-        self.ini = IniFile(os.path.join(input_dir, "DTASettings.txt"))
-        # demand loading period (g_DetermineDemandLoadingPeriod)
-        self.start = 0
-        self.end = 1440
-        self.horizon = 1740
-        self._determine_demand_period()
-        # settings from DTASettings.txt (g_ReadDTALiteSettings)
-        ini = self.ini
-        self.aggregation_interval = ini.get_int(
-            "assignment", "aggregation_time_interval_in_min", 15)
-        self.agent_based_flag = ini.get_int(
-            "assignment", "agent_based_assignment", 0)
-        self.demand_scaling = ini.get_float(
-            "simulation", "demand_capcaity_scaling_factor", 1.0)
-        self.use_pq_on_ramps = ini.get_int(
-            "simulation", "use_point_queue_for_on_ramps", 1)
-        self.use_pq_off_ramps = ini.get_int(
-            "simulation", "use_point_queue_for_off_ramps", 1)
-        self.info_updating_interval = ini.get_int(
-            "traveler_information", "information_updating_interval_in_min", 1)
-        self.emission_output_flag = ini.get_int(
-            "emission", "output_emission_data", 1)
-        # Standalone emission state. run_pysim() overwrites
-        # emission_mode / emission_output_flag from its emissions
-        # parameter right after the World is built, so DTASettings
-        # never decides the tier. emissions_computed is set by the
-        # full post-pass; the link tables are set by it as well.
+        # Bare v2 settings, hardcoded: there is no DTASettings.txt
+        # and no input_scenario_settings.csv. signal_model is 0
+        # (no signals); the point-queue flags are dead because no
+        # link is a ramp (every link is hardcoded type "f"), and
+        # the info-updating interval is dead because every agent
+        # has information_type 1, so info_updating_flag stays False.
+        self.flow_model = flow_model
+        self.random_seed = random_seed
+        self.signal_model = 0
+        self.num_iterations = 0  # a single loading pass, always
+        self.aggregation_interval = 15
+        self.agent_based_flag = 1
+        self.demand_scaling = f32(1.0)
+        self.use_pq_on_ramps = 1
+        self.use_pq_off_ramps = 1
+        self.info_updating_interval = 1
         self.emission_mode = "off"
         self.emissions_computed = False
         self.full_link_moe = None
         self.full_link_tdmoe = None
-        # scenario settings (g_DTALiteMultiScenarioMain, first scenario row)
-        self.random_seed = 100
-        self.num_iterations = 0  # TotalUEIterationNumber - 1
-        self.flow_model = 2
-        self.signal_model = 0
-        self._read_scenario()
+        # Simulation window from the agent file itself: the
+        # earliest departure to the latest departure, horizon 300
+        # minutes later (the v1 construction horizon rule).
+        self.start = 0
+        self.end = 1440
+        self.horizon = 1740
+        self._determine_demand_period()
         self.horizon = self.end + 300
         # assignment period grid (g_ReadAssignmentPeriodSettings)
         self._build_assignment_periods()
@@ -276,14 +270,10 @@ class World:
         self.node_index = {}       # node number -> internal id
         self.links = []
         self.link_map = {}         # (from number, to number) -> link index
-        self.link_types = {}       # link_type -> LinkType
-        self.zones = {}            # zone_id -> Zone
+        self.link_types = {}       # link_type -> LinkType (bare: only 1)
+        self.zones = {}            # zone_id -> Zone (bare: zone = node)
         self.od_zone_size = 0      # max zone id
-        self.demand_types = []     # index = demand_type - 1
-        self.vehicle_types_ordered = []  # (vehicle_type, name) in file order
-        self.vehicle_type_names = []
-        self.vehicle_type_pce = []
-        self.vehicle_type_age_pct = []
+        self.demand_types = [DemandType()]  # bare: only type 1, unused
         # vehicles: g_VehicleMap (sorted by agent_id) + creation order list
         self.vehicles = {}
         self.vehicle_order = []
@@ -295,84 +285,51 @@ class World:
         self.gen_rng = VehicleGenerationRng()
         self.info_updating_flag = False
 
-    # ----- settings / scenario -----
-
     def _path(self, name):
         return os.path.join(self.dir, name)
 
     def _determine_demand_period(self):
-        # g_DetermineDemandLoadingPeriod (DTALite.cpp:4823): the loading
-        # window is the min start / max end over the demand file list
-        # records (fields start_time_in_min / end_time_in_min).
-        path = self._path("input_demand_file_list.csv")
-        start, end = 1440, 0
-        seen = False
-        if os.path.exists(path):
-            parser = CsvParser(path)
-            while parser.read_record():
-                ok, seq = parser.get("file_sequence_no", "int")
-                if not ok or seq <= -1:
-                    break
-                ok, file_name = parser.get("file_name", "str")
-                if not ok or len(file_name) == 0:
-                    break
-                ok, rec_start = parser.get("start_time_in_min", "int")
-                if not ok:
-                    raise ProgramStop(
-                        "start_time_in_min missing in demand file list")
-                ok, rec_end = parser.get("end_time_in_min", "int")
-                if not ok:
-                    raise ProgramStop(
-                        "end_time_in_min missing in demand file list")
-                # Construction version: horizon cap lifted from 2880
-                # to 1,000,000 min for multi-day/month runs. Only a
-                # negative start, an end beyond that cap, or an
-                # end at/before the start fails loud.
-                if rec_end > 1000000 or rec_start < 0:
-                    raise ProgramStop("demand loading period out of range")
-                seen = True
-                start = min(start, rec_start)
-                end = max(end, rec_end)
-        if seen and end <= start:
-            raise ProgramStop(
-                "demand loading period end (%d) must be after start (%d)"
-                % (end, start))
-        if start > end:
-            start, end = 0, 1400
-        self.start, self.end = start, end
-
-    def _read_scenario(self):
-        path = self._path("input_scenario_settings.csv")
+        # Bare v2: the window comes from input_agent.csv, not from
+        # a demand file list. start is the floor of the earliest
+        # departure, end the ceiling of the latest; a single
+        # departure still gets a one-minute window so the agent
+        # itself is inside it. The 1,000,000-minute cap and the
+        # negative-start rule are carried over from v1.
+        path = self._path("input_agent.csv")
         if not os.path.exists(path):
-            return
+            raise ProgramStop(
+                "input_agent.csv cannot be opened in %s" % self.dir)
         parser = CsvParser(path)
-        if not parser.read_record():
-            return
-        ok, seed = parser.get("random_seed", "int")
-        if ok:
-            self.random_seed = seed
-        ok, total = parser.get("number_of_assignment_days", "int")
-        if not ok:
-            ok, total = parser.get("number_of_iterations", "int")
-        if ok:
-            self.num_iterations = total - 1
-        ok, model = parser.get("traffic_flow_model", "int")
-        if ok:
-            self.flow_model = model
-        ok, sig = parser.get("signal_representation_model", "int")
-        if ok:
-            self.signal_model = sig
+        earliest = None
+        latest = None
+        while parser.read_record():
+            ok, departure = parser.get("departure_time_in_min", "double")
+            if not ok:
+                raise ProgramStop(
+                    "departure_time_in_min missing in input_agent.csv")
+            if departure < 0:
+                raise ProgramStop(
+                    "agent departure %s is negative" % (departure,))
+            earliest = departure if earliest is None else min(earliest, departure)
+            latest = departure if latest is None else max(latest, departure)
+        if earliest is None:
+            raise ProgramStop("no agents in input_agent.csv")
+        start = int(math.floor(float(earliest)))
+        end = int(math.ceil(float(latest)))
+        if end > 1000000:
+            raise ProgramStop("demand loading period out of range")
+        if end <= start:
+            end = start + 1
+        self.start, self.end = start, end
 
     def _build_assignment_periods(self):
         # g_ReadAssignmentPeriodSettings (DTALite.cpp:5900): the
         # uniform grid is built first, then unconditionally
         # overwritten by the absolute 15-minute grid; the last
-        # interval closes at the loading end time. Construction
-        # version: the grid is sized by the horizon instead of a
-        # fixed 300 slots, so departures beyond 4485 min no longer
-        # index past the end of the grid. For horizons up to the
-        # v2 range the values are identical to v2 (only the
-        # trailing, never-indexed tail of the arrays is longer).
+        # interval closes at the loading end time. The grid is
+        # sized by the horizon instead of a fixed 300 slots, so
+        # departures beyond 4485 min no longer index past the end
+        # of the grid (v1 fix, kept here).
         max_slot = self.horizon // 15 + 1
         size = max_slot + 1
         index = [0] * size
@@ -448,187 +405,15 @@ class World:
                        link.moe[time].cum_departure)
         return 0
 
-    # ----- input readers (g_ReadInputFiles) -----
+    # ----- input readers (bare v2) -----
 
     def read_inputs(self):
         self.well_rng = WellRng(self.random_seed)
         self._read_nodes()
-        self._read_link_types()
         self._read_links()
         self._setup_merges()
-        self._read_zones()
-        self._read_activity_locations()
-        self._read_demand_types()
-        self._read_vehicle_types()
-        self._read_demand_files()
-
-    def _read_nodes(self):
-        parser = CsvParser(self._path("input_node.csv"))
-        i = 0
-        while parser.read_record():
-            ok, node_id = parser.get("node_id", "int", required=True)
-            if not ok:
-                break
-            node = Node()
-            node.node_id = i
-            node.number = node_id
-            ok, x = parser.get("x", "double")
-            node.x = x if ok else 0.0
-            ok, y = parser.get("y", "double")
-            node.y = y if ok else 0.0
-            self.nodes.append(node)
-            self.node_index[node_id] = i
-            i += 1
-
-    def _read_link_types(self):
-        parser = CsvParser(self._path("input_link_type.csv"))
-        line_no = 0
-        while parser.read_record():
-            element = LinkType()
-            ok, lt = parser.get("link_type", "int")
-            if not ok:
-                if line_no == 0:
-                    raise ProgramStop("link_type missing in input_link_type")
-                break
-            if lt in self.link_types:
-                raise ProgramStop("duplicate link_type %d" % lt)
-            element.link_type = lt
-            ok, name = parser.get("link_type_name", "str")
-            if ok:
-                element.name = name
-            ok, code = parser.get("type_code", "str")
-            element.type_code = code if ok else "n"
-            ok, bias = parser.get("travel_time_bias_factor", "float")
-            if ok:
-                element.bias = bias
-            ok, adj = parser.get("capacity_adjustment_factor", "float")
-            if ok:
-                element.cap_adj = adj
-            self.link_types[lt] = element
-            line_no += 1
-
-    def link_type_of(self, link_type):
-        # g_LinkTypeMap[type]: operator[] default-constructs missing entries
-        element = self.link_types.get(link_type)
-        if element is None:
-            element = LinkType()
-            element.link_type = link_type
-            self.link_types[link_type] = element
-        return element
-
-    def _read_links(self):
-        parser = CsvParser(self._path("input_link.csv"))
-        i = 0
-        while parser.read_record():
-            ok, from_name = parser.get("from_node_id", "int")
-            if not ok:
-                if i == 0:
-                    raise ProgramStop("from_node_id missing in input_link.csv")
-                break
-            ok, to_name = parser.get("to_node_id", "int")
-            if not ok:
-                raise ProgramStop("to_node_id missing in input_link.csv")
-            ok, mode = parser.get("mode_code", "str")
-            if not ok:
-                mode = ""
-            if mode in ("w", "t", "b", "n"):
-                continue
-            ok, link_type = parser.get("link_type", "int")
-            if not ok:
-                link_type = 0
-            element = self.link_type_of(link_type)
-            if "n" in element.type_code or "b" in element.type_code:
-                continue
-            if from_name not in self.node_index or to_name not in self.node_index:
-                continue
-            ok, direction = parser.get("direction", "int")
-            if not ok:
-                direction = 1
-            ok, length = parser.get("length", "double")
-            if not ok:
-                ok, length = parser.get("length_", "double")
-            if not ok:
-                length = 1.0
-            ok, lanes = parser.get("number_of_lanes", "int")
-            if not ok:
-                lanes = 1
-            ok, speed = parser.get("speed_limit", "int")
-            if not ok:
-                speed = 0
-            ok, capacity = parser.get("lane_cap", "double")
-            if not ok:
-                ok, capacity = parser.get(
-                    "lane_capacity_in_vhc_per_hour", "double")
-            if not ok:
-                capacity = 0.0
-            ok, k_jam = parser.get("jam_density", "double")
-            if not ok:
-                ok, k_jam = parser.get("jam_density_in_vhc_pmpl", "double")
-            if not ok:
-                k_jam = 180.0
-            ok, wave = parser.get("wave_speed", "double")
-            if not ok:
-                ok, wave = parser.get("wave_speed_in_mph", "double")
-            if not ok:
-                wave = 12.0
-            ok, geometry = parser.get("geometry", "str")
-            if lanes == 0 or capacity < 1 or speed < 1:
-                continue
-            if direction == 0:
-                self._add_link(from_name, to_name, length, lanes, speed,
-                               capacity, k_jam, wave, link_type,
-                               geometry if ok else "")
-                self._add_link(to_name, from_name, length, lanes, speed,
-                               capacity, k_jam, wave, link_type,
-                               geometry if ok else "")
-            elif direction == -1:
-                self._add_link(to_name, from_name, length, lanes, speed,
-                               capacity, k_jam, wave, link_type,
-                               geometry if ok else "")
-            else:
-                self._add_link(from_name, to_name, length, lanes, speed,
-                               capacity, k_jam, wave, link_type,
-                               geometry if ok else "")
-            i += 1
-
-    def _add_link(self, from_name, to_name, length, lanes, speed, capacity,
-                  k_jam, wave, link_type, geometry):
-        link = Link()
-        link.link_no = len(self.links)
-        link.from_id = self.node_index[from_name]
-        link.to_id = self.node_index[to_name]
-        speed_f = f32(speed)
-        length_f = f32(max(0.00001, length))
-        if self.flow_model != 0:  # not BPR: minimum length from speed
-            length_f = f32(max(length_f, f32(f32(speed_f * f32(0.1)) /
-                                             f32(60.0))))
-        link.length = length_f
-        link.speed_limit = speed_f
-        element = self.link_type_of(link_type)
-        link.lane_capacity = f32(f32(capacity) * element.cap_adj)
-        link.k_jam = f32(k_jam)
-        link.wave_speed = f32(wave)
-        link.inflow_lanes = lanes
-        link.outflow_lanes = lanes
-        link.link_type = link_type
-        link.type_code = element.type_code
-        link.merge_flag = 0
-        link.on_ramp = False
-        link.merge_incoming = []
-        link.merge_remaining = f32(0)
-        link.rng = LinkRNG(link.link_no)
-        link.org_geometry = geometry
-        # m_VehicleSpaceCapacity = max(1, m_Length * outflow lanes * K_jam)
-        # evaluated in double (K_jam is the double local), stored as float
-        # (DTALite.cpp:1455)
-        link.space_capacity = f32(max(1.0, float(link.length) * lanes *
-                                      k_jam))
-        # DTALink::SetupMOE at read time; repeated at loading start
-        link.setup_moe(self.horizon)
-        self.links.append(link)
-        self.nodes[link.from_id].outgoing.append(link.link_no)
-        self.nodes[link.to_id].incoming.append(link.link_no)
-        self.link_map[(from_name, to_name)] = link.link_no
+        self._generate_zones()
+        self._read_agents()
 
     def _setup_merges(self):
         # merge identification over the incoming links at each link's
@@ -682,181 +467,180 @@ class World:
                 if self.use_pq_off_ramps == 1:
                     link.space_capacity = f32(99999)
 
-    def _read_zones(self):
-        path = self._path("input_zone.csv")
-        if not os.path.exists(path):
-            raise ProgramStop("input_zone.csv cannot be opened")
-        parser = CsvParser(path)
-        i = 0
-        max_zone = 0
-        while parser.read_record():
-            ok, zone_id = parser.get("zone_id", "int")
-            if not ok:
-                raise ProgramStop("zone_id missing in input_zone.csv")
-            if zone_id == 0:
-                raise ProgramStop("zone_id = 0 in input_zone.csv")
-            max_zone = max(max_zone, zone_id)
+    def _generate_zones(self):
+        # Bare v2: zone = node. No zone file is read; the zone
+        # dict is built from the nodes in file order, and a node
+        # is an origin activity location when it has an outgoing
+        # link and a destination activity location when it has an
+        # incoming link (the exe's fallback when no activity
+        # location file exists).
+        for i, node in enumerate(self.nodes):
             zone = Zone()
-            zone.zone_id = zone_id
+            zone.zone_id = node.number
             zone.seq_no = i
-            i += 1
-            self.zones[zone_id] = zone
-        if max_zone == 0:
-            raise ProgramStop("0 zone in input_zone.csv")
-        self.od_zone_size = max_zone
+            node.zone_id = node.number
+            if len(node.outgoing) >= 1:
+                zone.origin_activity.append(i)
+            if len(node.incoming) >= 1:
+                zone.dest_activity.append(i)
+            self.zones[node.number] = zone
+            self.od_zone_size = max(self.od_zone_size, node.number)
 
-    def _zone(self, zone_id):
-        zone = self.zones.get(zone_id)
-        if zone is None:
-            zone = Zone()
-            zone.zone_id = zone_id
-            self.zones[zone_id] = zone
-        return zone
-
-    def _read_activity_locations(self):
-        path = self._path("input_activity_location.csv")
-        rows = []
-        if os.path.exists(path):
-            parser = CsvParser(path)
-            while parser.read_record():
-                ok, zone_id = parser.get("zone_id", "int")
-                if not ok:
-                    break
-                ok, node_number = parser.get("node_id", "int")
-                if not ok:
-                    break
-                ok, flag = parser.get("external_OD_flag", "int")
-                if not ok:
-                    flag = 0
-                rows.append((zone_id, node_number, flag))
-        else:
-            # the exe generates the file: every node is its own zone
-            for node in self.nodes:
-                rows.append((node.number, node.number, 0))
-        for zone_id, node_number, flag in rows:
-            if node_number not in self.node_index:
-                raise ProgramStop(
-                    "activity location node %d undefined" % node_number)
-            node_id = self.node_index[node_number]
-            node = self.nodes[node_id]
-            self.od_zone_size = max(self.od_zone_size, zone_id)
-            node.zone_id = zone_id
-            zone = self._zone(zone_id)
-            if flag != -1 and len(node.outgoing) >= 1:
-                zone.origin_activity.append(node_id)
-            if flag != 1 and len(node.incoming) >= 1:
-                zone.dest_activity.append(node_id)
-
-    def _read_demand_types(self):
-        path = self._path("input_demand_type.csv")
-        if not os.path.exists(path):
-            return
-        parser = CsvParser(path)
-        while parser.read_record():
-            ok, dtype = parser.get("demand_type", "int")
-            if not ok:
-                break
-            element = DemandType()
-            ok, vot = parser.get("avg_VOT", "float")
-            if ok:
-                element.avg_vot = vot
-            # info class percentages: class 1 historical, 2 pre-trip, 3 en-route
-            ok, pre = parser.get("percentage_of_pretrip_info", "float")
-            ok2, enr = parser.get("percentage_of_enroute_info", "float")
-            pre = float(pre) if ok else 0.0
-            enr = float(enr) if ok2 else 0.0
-            pct = [100.0 - pre - enr, pre, enr, 0.0]
-            cum = []
-            total = 0.0
-            for value in pct:
-                total += value
-                cum.append(total)
-            element.cum_info_pct = cum
-            while len(self.demand_types) < dtype:
-                self.demand_types.append(DemandType())
-            self.demand_types[dtype - 1] = element
-
-    def _read_vehicle_types(self):
-        path = self._path("optional_vehicle_type.csv")
-        if not os.path.exists(path):
-            return
-        parser = CsvParser(path)
-        while parser.read_record():
-            ok, vtype = parser.get("vehicle_type", "int")
-            if not ok:
-                break
-            ok, name = parser.get("vehicle_type_name", "str")
-            okp, pce = parser.get("PCE", "float")
-            ages = []
-            for col in ("percentage_of_age_0", "percentage_of_age_5",
-                        "percentage_of_age_10", "percentage_of_age_15"):
-                ok_a, value = parser.get(col, "float")
-                ages.append(float(value) if ok_a else 0.0)
-            while len(self.vehicle_type_names) < vtype:
-                self.vehicle_type_names.append("")
-                self.vehicle_type_pce.append(f32(1))
-                self.vehicle_type_age_pct.append([])
-            self.vehicle_type_names[vtype - 1] = name if ok else ""
-            self.vehicle_type_pce[vtype - 1] = pce if okp else f32(1)
-            self.vehicle_type_age_pct[vtype - 1] = ages
-            self.vehicle_types_ordered.append((vtype, name if ok else ""))
-
-    # ----- demand files (g_ReadDemandFileBasedOnDemandFileList) -----
-
-    def _read_demand_files(self):
-        parser = CsvParser(self._path("input_demand_file_list.csv"))
-        while parser.read_record():
-            ok, file_name = parser.get("file_name", "str")
-            if not ok:
-                continue
-            ok, fmt = parser.get("format_type", "str")
-            if not ok:
-                continue
-            if "agent_csv" in fmt:
-                self.agent_based_flag = 1
-                self._read_agent_file(file_name)
-            elif "agent_bin" in fmt:
-                raise ProgramStop("agent_bin demand not supported by pysim")
-            # matrix 'demand' formats are out of scope for the pipeline mode
-
-    def _vehicle_attributes(self, demand_type):
-        # g_GetVehicleAttributes (Utility.cpp:317): returns
-        # (vehicle_type, information_class, vot, age) demand-type defaults.
-        # Vehicle type defaults to 1; information class and age come from
-        # percentage draws on the global WELL RNG.
-        if demand_type - 1 >= len(self.demand_types):
+    def _read_nodes(self):
+        if not os.path.exists(self._path("input_node.csv")):
             raise ProgramStop(
-                "demand_type %d not defined in input_demand_type.csv"
-                % demand_type)
-        element = self.demand_types[demand_type - 1]
-        vehicle_type = 1
-        info_class = 1
-        pct = self.well_rng.ratio() * 100.0
-        pct = self.well_rng.ratio() * 100.0
-        for i in range(1, 4):
-            if element.cum_info_pct[i - 1] <= pct < element.cum_info_pct[i]:
-                info_class = i
-        age = 0
-        if vehicle_type >= 1 and self.vehicle_type_age_pct:
-            pct = self.well_rng.ratio() * 100.0
-            ages = self.vehicle_type_age_pct[vehicle_type - 1]
-            prev = 0.0
-            cum = 0.0
-            for i, value in enumerate(ages):
-                cum += value
-                if prev < pct <= cum:
-                    age = i
-                    break
-                prev = cum
-        self.well_rng.ratio()  # final draw before the VOT assignment
-        vot = element.avg_vot
-        if vot < 1:
-            vot = f32(1)
-        return vehicle_type, info_class, vot, age
+                "input_node.csv cannot be opened in %s" % self.dir)
+        # Only node_id is required. x/y are not read at all: no
+        # output in this package uses coordinates, so a bare file
+        # without them and an old file with them behave the same.
+        parser = CsvParser(self._path("input_node.csv"))
+        i = 0
+        while parser.read_record():
+            ok, node_id = parser.get("node_id", "int", required=True)
+            if not ok:
+                break
+            if node_id in self.node_index:
+                raise ProgramStop(
+                    "duplicate node_id %d in input_node.csv" % node_id)
+            node = Node()
+            node.node_id = i
+            node.number = node_id
+            self.nodes.append(node)
+            self.node_index[node_id] = i
+            i += 1
+        if not self.nodes:
+            raise ProgramStop("no nodes in input_node.csv")
 
-    def _read_agent_file(self, file_name):
-        # g_ReadTripCSVFile (Agent.cpp:205) for one input agent csv
-        parser = CsvParser(self._path(file_name))
+    def link_type_of(self, link_type):
+        # Bare v2: only type 1 exists (set in _read_links); anything
+        # else default-constructs, as g_LinkTypeMap[type] did.
+        element = self.link_types.get(link_type)
+        if element is None:
+            element = LinkType()
+            element.link_type = link_type
+            self.link_types[link_type] = element
+        return element
+
+    def _read_links(self):
+        # Bare v2 link schema. direction is ignored (one row is
+        # always exactly one directed link, from -> to as written;
+        # no reverse link is created and no link is reversed).
+        # link_type is ignored and hardcoded to 1 / "f" (Freeway,
+        # bias 1.0, capacity adjustment 1.0): Sioux Falls is 76/76
+        # Freeway, so this preserves its merge behaviour, and the
+        # merge test in _setup_merges never triggers there. mode,
+        # geometry, link_type_name and any other extra column are
+        # ignored, never rejected. Every row is a vehicle link.
+        freeway = LinkType()
+        freeway.link_type = 1
+        freeway.name = "Freeway"
+        freeway.type_code = "f"
+        freeway.bias = f32(1.0)
+        freeway.cap_adj = f32(1.0)
+        self.link_types[1] = freeway
+        if not os.path.exists(self._path("input_link.csv")):
+            raise ProgramStop(
+                "input_link.csv cannot be opened in %s" % self.dir)
+        parser = CsvParser(self._path("input_link.csv"))
+        while parser.read_record():
+            ok, from_name = parser.get("from_node_id", "int", required=True)
+            if not ok:
+                raise ProgramStop("from_node_id missing in input_link.csv")
+            ok, to_name = parser.get("to_node_id", "int", required=True)
+            if not ok:
+                raise ProgramStop("to_node_id missing in input_link.csv")
+            if from_name not in self.node_index:
+                raise ProgramStop(
+                    "input_link.csv from_node_id %d not in input_node.csv"
+                    % from_name)
+            if to_name not in self.node_index:
+                raise ProgramStop(
+                    "input_link.csv to_node_id %d not in input_node.csv"
+                    % to_name)
+            if (from_name, to_name) in self.link_map:
+                raise ProgramStop(
+                    "duplicate link %d->%d in input_link.csv"
+                    % (from_name, to_name))
+            ok, length = parser.get("length", "double")
+            if not ok:
+                ok, length = parser.get("length_", "double")
+            if not ok:
+                length = 1.0
+            ok, lanes = parser.get("number_of_lanes", "int")
+            if not ok:
+                lanes = 1
+            ok, speed = parser.get("speed_limit", "int")
+            if not ok:
+                speed = 0
+            ok, capacity = parser.get("lane_capacity_in_vhc_per_hour",
+                                      "double")
+            if not ok:
+                ok, capacity = parser.get("lane_cap", "double")
+            if not ok:
+                capacity = 0.0
+            ok, k_jam = parser.get("jam_density", "double")
+            if not ok:
+                ok, k_jam = parser.get("jam_density_in_vhc_pmpl", "double")
+            if not ok:
+                k_jam = 180.0
+            ok, wave = parser.get("wave_speed", "double")
+            if not ok:
+                ok, wave = parser.get("wave_speed_in_mph", "double")
+            if not ok:
+                wave = 12.0
+            if lanes == 0 or capacity < 1 or speed < 1:
+                raise ProgramStop(
+                    "bad link %d->%d in input_link.csv: lanes=%s, "
+                    "capacity=%s, speed=%s"
+                    % (from_name, to_name, lanes, capacity, speed))
+            self._add_link(from_name, to_name, length, lanes, speed,
+                           capacity, k_jam, wave, 1, "")
+
+    def _add_link(self, from_name, to_name, length, lanes, speed, capacity,
+                  k_jam, wave, link_type, geometry):
+        link = Link()
+        link.link_no = len(self.links)
+        link.from_id = self.node_index[from_name]
+        link.to_id = self.node_index[to_name]
+        speed_f = f32(speed)
+        length_f = f32(max(0.00001, length))
+        if self.flow_model != 0:  # not BPR: minimum length from speed
+            length_f = f32(max(length_f, f32(f32(speed_f * f32(0.1)) /
+                                             f32(60.0))))
+        link.length = length_f
+        link.speed_limit = speed_f
+        element = self.link_type_of(link_type)
+        link.lane_capacity = f32(f32(capacity) * element.cap_adj)
+        link.k_jam = f32(k_jam)
+        link.wave_speed = f32(wave)
+        link.inflow_lanes = lanes
+        link.outflow_lanes = lanes
+        link.link_type = link_type
+        link.type_code = element.type_code
+        link.merge_flag = 0
+        link.on_ramp = False
+        link.merge_incoming = []
+        link.merge_remaining = f32(0)
+        link.rng = LinkRNG(link.link_no)
+        link.org_geometry = geometry
+        # m_VehicleSpaceCapacity = max(1, m_Length * outflow lanes * K_jam)
+        # evaluated in double (K_jam is the double local), stored as float
+        # (DTALite.cpp:1455)
+        link.space_capacity = f32(max(1.0, float(link.length) * lanes *
+                                      k_jam))
+        # DTALink::SetupMOE at read time; repeated at loading start
+        link.setup_moe(self.horizon)
+        self.links.append(link)
+        self.nodes[link.from_id].outgoing.append(link.link_no)
+        self.nodes[link.to_id].incoming.append(link.link_no)
+        self.link_map[(from_name, to_name)] = link.link_no
+
+    def _read_agents(self):
+        path = self._path("input_agent.csv")
+        if not os.path.exists(path):
+            raise ProgramStop(
+                "input_agent.csv cannot be opened in %s" % self.dir)
+        parser = CsvParser(path)
         line_no = 0
         while parser.read_record():
             if len(parser.fields) == 0:
@@ -865,96 +649,78 @@ class World:
             self._read_agent_record(parser, line_no)
 
     def _read_agent_record(self, parser, line_no):
+        # Bare v2 agent schema: exactly input_agent.csv, pathless
+        # agents only, zone = node. from_zone_id / to_zone_id are
+        # accepted and ignored when present.
         ok, agent_id = parser.get("agent_id", "int", required=True)
         if not ok:
-            raise ProgramStop("agent_id missing in agent file")
-        veh = self.vehicles.get(agent_id)
-        is_new = veh is None
-        if is_new:
-            veh = Vehicle(agent_id)
-        ok, tour_id = parser.get("tour_id", "int")
-        if ok and tour_id >= 0:
-            veh.tour_id = tour_id
-        ok, from_zone = parser.get("from_zone_id", "int", required=True)
+            raise ProgramStop("agent_id missing in input_agent.csv")
+        if agent_id in self.vehicles:
+            raise ProgramStop(
+                "duplicate agent_id %d in input_agent.csv" % agent_id)
+        ok, from_node = parser.get("origin_node_id", "int")
         if not ok:
-            return
-        ok, to_zone = parser.get("to_zone_id", "int", required=True)
+            ok, from_node = parser.get("from_origin_node_id", "int")
         if not ok:
-            return
-        if from_zone not in self.zones or to_zone not in self.zones:
-            return  # zone not defined: skip this record
-        veh.origin_zone = from_zone
-        veh.dest_zone = to_zone
-        ok, from_node = parser.get("from_origin_node_id", "int",
-                                   required=True)
+            raise ProgramStop(
+                "agent %d: origin node missing in input_agent.csv "
+                "(origin_node_id or from_origin_node_id)" % agent_id)
+        ok, to_node = parser.get("destination_node_id", "int")
         if not ok:
-            return
-        ok, to_node = parser.get("to_destination_node_id", "int",
-                                 required=True)
+            ok, to_node = parser.get("to_destination_node_id", "int")
         if not ok:
-            return
-        veh.origin_node = self._node_or_zone_activity(
-            from_node, from_zone, agent_id, origin=True)
-        veh.dest_node = self._node_or_zone_activity(
-            to_node, to_zone, agent_id, origin=False)
-        if veh.origin_node == veh.dest_node:
-            return  # intrazonal: silently skipped, never registered
-        ok, departure = parser.get("departure_time_in_min", "float",
-                                   required=True)
+            raise ProgramStop(
+                "agent %d: destination node missing in input_agent.csv "
+                "(destination_node_id or to_destination_node_id)"
+                % agent_id)
+        # Zone columns, if present, are ignored: zone = node.
+        parser.get("from_zone_id", "int")
+        parser.get("to_zone_id", "int")
+        if from_node not in self.node_index:
+            raise ProgramStop(
+                "agent %d origin node %d not in input_node.csv"
+                % (agent_id, from_node))
+        if to_node not in self.node_index:
+            raise ProgramStop(
+                "agent %d destination node %d not in input_node.csv"
+                % (agent_id, to_node))
+        ok, departure = parser.get("departure_time_in_min", "double")
         if not ok:
-            return
-        veh.departure = departure
-        if veh.departure < self.start or veh.departure > self.end:
+            raise ProgramStop(
+                "agent %d departure_time_in_min missing" % agent_id)
+        if departure < 0:
+            raise ProgramStop(
+                "agent %d departure %s is negative"
+                % (agent_id, float(departure)))
+        if departure < self.start or departure > self.end:
             raise ProgramStop(
                 "agent %d departure %s outside loading window"
                 % (agent_id, float(departure)))
-        # attribute block, gated on a non-empty demand_type cell
-        ok, demand_type = parser.get("demand_type", "int")
-        if ok:
-            veh.demand_type = demand_type
-            vtype, info, vot, age = self._vehicle_attributes(demand_type)
-            veh.vehicle_type = vtype
-            veh.info_type = info
-            veh.vot = vot
-            veh.age = age
-            ok, file_vtype = parser.get("vehicle_type", "int", required=True)
-            if ok and file_vtype >= 1:
-                veh.vehicle_type = file_vtype
-            info_local = veh.info_type
-            ok, file_info = parser.get("information_type", "int",
-                                       required=True)
-            if ok:
-                info_local = file_info
-            ok, file_vot = parser.get("value_of_time", "int", required=True)
-            if ok and file_vot >= 1:
-                veh.vot = f32(file_vot)
-            ok, file_age = parser.get("vehicle_age", "int", required=True)
-            if ok:
-                veh.age = file_age
-            if is_new:
-                veh.info_type = info_local
-        # path (the block runs only when the field carries a value)
         ok, path_text = parser.get("path_node_sequence", "str")
-        if not ok:
-            return self._register(veh, is_new)
-        node_numbers = parse_path_integers(path_text)
-        if len(node_numbers) == 1:
-            raise ProgramStop("agent %d path has a single node" % agent_id)
-        if len(node_numbers) >= 2:
-            for a, b in zip(node_numbers, node_numbers[1:]):
-                if (a, b) not in self.link_map:
-                    raise ProgramStop(
-                        "agent %d path uses undefined link %d->%d"
-                        % (agent_id, a, b))
-            if node_numbers[0] != from_node or node_numbers[-1] != to_node:
-                raise ProgramStop(
-                    "agent %d path endpoints do not match its OD nodes"
-                    % agent_id)
-            self._assign_path(veh, node_numbers)
-        else:
-            veh.node_size = 0
-            veh.link_ary = None
-        self._register(veh, is_new)
+        if ok:
+            raise ProgramStop(
+                "bare v2 agents must be pathless: agent %d has a "
+                "path_node_sequence" % agent_id)
+        if from_node == to_node:
+            return  # intrazonal: silently skipped, as in v1
+        veh = Vehicle(agent_id)
+        veh.origin_zone = from_node
+        veh.dest_zone = to_node
+        veh.origin_node = self.node_index[from_node]
+        veh.dest_node = self.node_index[to_node]
+        veh.departure = departure
+        # Hardcoded per agent (v1 defaults): no RNG draw is made
+        # for information class or age in bare v2, so random_seed
+        # has no effect on results. info_type 1 means
+        # info_updating_flag stays False and every reroute is a
+        # free-flow shortest path excluding barred links.
+        veh.demand_type = 1
+        veh.vehicle_type = 1
+        veh.pce = f32(1)
+        veh.info_type = 1
+        veh.vot = f32(10)
+        veh.age = 5
+        self._register(veh, True)
 
     def _register(self, veh, is_new):
         # create-branch registration: g_VehicleMap insert plus the
@@ -966,57 +732,3 @@ class World:
             key = int(f32(veh.departure * f32(10)))
             self.original_td_map.setdefault(key, []).append(veh.agent_id)
 
-    def _node_or_zone_activity(self, node_number, zone_id, agent_id, origin):
-        # unknown node numbers fall back to a zone activity location chosen
-        # by ratio (agent_id % 100) / 100 (Agent.cpp, GetRandom...NodeIDInZone)
-        if node_number in self.node_index:
-            return self.node_index[node_number]
-        zone = self.zones[zone_id]
-        candidates = zone.origin_activity if origin else zone.dest_activity
-        if len(candidates) == 0:
-            raise ProgramStop("zone %d has no activity locations" % zone_id)
-        ratio = f32(f32(agent_id % 100) / f32(100.0))
-        index = int(f32(ratio * f32(len(candidates))))
-        if index >= len(candidates):
-            index = len(candidates) - 1
-        return candidates[index]
-
-    def _assign_path(self, veh, node_numbers):
-        # AddPathToVehicle (DTALite.cpp:2971)
-        veh.node_size = len(node_numbers)
-        veh.link_ary = [VehicleLink(MAX_LINK_NO)
-                        for _ in range(len(node_numbers))]
-        veh.distance = f32(0)
-        for i in range(1, len(node_numbers)):
-            link_no = self.link_map[(node_numbers[i - 1], node_numbers[i])]
-            veh.link_ary[i - 1].link_no = link_no
-            veh.distance = f32(veh.distance + self.links[link_no].length)
-        veh.origin_node = self.node_index[node_numbers[0]]
-        veh.dest_node = self.node_index[node_numbers[-1]]
-
-
-def parse_path_integers(text):
-    # ParseLineToIntegers: ';'-separated atoi tokens; a trailing ';' does
-    # not produce an extra token; empty text gives an empty path.
-    if text is None or text == "":
-        return []
-    parts = text.split(";")
-    if text.endswith(";"):
-        parts = parts[:-1]
-    values = []
-    for part in parts:
-        token = part.strip()
-        value = 0
-        sign = 1
-        digits = ""
-        for ch in token:
-            if ch in "+-" and not digits:
-                sign = -1 if ch == "-" else 1
-            elif ch.isdigit():
-                digits += ch
-            else:
-                break
-        if digits:
-            value = sign * int(digits)
-        values.append(value)
-    return values

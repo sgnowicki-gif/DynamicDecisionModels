@@ -1,5 +1,5 @@
-# The three construction-only output files. The four v2 files are
-# written unchanged by outputs.py; nothing here touches them.
+# The three construction-only output files. Bare v2 writes no
+# other files: there is no agent, trip or link output writer.
 import os
 
 from .construction import _fmt_time
