@@ -16,6 +16,11 @@ class Simulator:
     def __init__(self, world, construction=None):
         self.world = world
         self.construction = construction
+        # Stepwise v3 only: penalty accumulated by the current
+        # segment (reset by run_segment before its steps run).
+        # network_loading never touches it; the session loop
+        # reads it after the segment's last step.
+        self.segment_penalty = 0.0
         # Vehicles whose departure has passed but which are held at
         # their origin because every path is currently barred. They
         # are not loaded and not counted as generated until a path
@@ -33,6 +38,34 @@ class Simulator:
         if self.construction is None:
             return set()
         return self.construction.barred_link_nos()
+
+    def _fftt_sum(self, link_nos):
+        return sum(float(self.world.links[ln].fftt)
+                   for ln in link_nos)
+
+    def _reroute_delta(self, veh, new_remaining):
+        # One reroute event: new remaining-path FFTT minus the
+        # old remaining-path FFTT from the same node. The caller
+        # passes the new remaining total and this method both
+        # adds the delta to the segment penalty and stores the
+        # new remaining total on the vehicle.
+        delta = float(new_remaining) - float(veh.remaining_fftt)
+        self.segment_penalty += delta
+        veh.remaining_fftt = float(new_remaining)
+
+    def _traversal_penalty(self, veh, seq):
+        # One completed link traversal: actual link travel time
+        # (DTAVehicle::GetLinkTravelTime semantics: first link
+        # is link exit minus departure, later links are successive
+        # abs_arrival differences) minus that link's FFTT. The
+        # traversed link's FFTT leaves the remaining total, so
+        # over a full trip the traversal terms plus the reroute
+        # deltas telescope to arrival-minus-departure minus the
+        # original-path FFTT (see session.py).
+        link = self.world.links[veh.link_ary[seq].link_no]
+        link_tt = float(self._link_travel_time(veh, seq))
+        self.segment_penalty += link_tt - float(link.fftt)
+        veh.remaining_fftt -= float(link.fftt)
 
     def _reroute_from(self, veh, starting_node, current_time):
         # Shortest path from starting_node to the destination with
@@ -125,6 +158,7 @@ class Simulator:
                 veh, veh.origin_node, current_time)
             if node_size >= 2:
                 del self.waiting[agent_id]
+                self._reroute_delta(veh, self._fftt_sum(path_links))
                 self._replace_path_from_origin(veh, path_links)
                 self._load_into_buffer(veh, now=current_time)
 
@@ -478,6 +512,8 @@ class Simulator:
                         node_size, new_links, _ = self._reroute_from(
                             veh, veh.origin_node, current_time)
                         if node_size >= 2:
+                            self._reroute_delta(
+                                veh, self._fftt_sum(new_links))
                             self._replace_path_from_origin(
                                 veh, new_links)
                         else:
@@ -519,6 +555,8 @@ class Simulator:
                         veh_b, veh_b.origin_node, current_time)
                     link.loading_buffer.popleft()
                     if node_size >= 2:
+                        self._reroute_delta(
+                            veh_b, self._fftt_sum(new_links))
                         self._replace_path_from_origin(veh_b, new_links)
                         if veh_b.construction_wait_since is None:
                             veh_b.construction_wait_since = f32(
@@ -761,6 +799,12 @@ class Simulator:
                     node_size_r, sub_links_r, _ = self._reroute_from(
                         veh, link.to_id, current_time)
                     if node_size_r >= 2:
+                        fftt_cur = float(link.fftt)
+                        new_remaining = fftt_cur + \
+                            self._fftt_sum(sub_links_r)
+                        self.segment_penalty += new_remaining - \
+                            float(veh.remaining_fftt)
+                        veh.remaining_fftt = new_remaining
                         combined = self._replace_suffix(
                             veh, seq, sub_links_r)
                         next_link = links[combined[seq + 1]]
@@ -774,6 +818,11 @@ class Simulator:
                         travel_time = minimum
                     veh.delay = f32(veh.delay +
                                     f32(travel_time - link.fftt))
+                    # Book this traversal now, at the pop: the
+                    # link is complete only when the vehicle
+                    # leaves it, and _link_travel_time reads the
+                    # abs_arrival stamps just written above.
+                    self._traversal_penalty(veh, seq)
                     veh.sim_link_seq = seq + 1
                     new_item = [item[0], -1,
                                 f32(arrival + next_link.fftt)]
@@ -814,6 +863,7 @@ class Simulator:
                 else:
                     travel_time = f32(arrival - veh.departure)
                 veh.delay = f32(veh.delay + f32(travel_time - link.fftt))
+                self._traversal_penalty(veh, seq)
                 veh.sim_link_seq = seq + 1
                 veh.arrival = arrival
                 veh.trip_time = f32(arrival - veh.departure)

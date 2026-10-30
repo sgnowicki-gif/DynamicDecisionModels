@@ -170,7 +170,13 @@ class Vehicle:
         # captured after iteration-0 assignment and before loading,
         # plus closure-wait bookkeeping for origin waiting.
         "closed_original_links", "closed_fftt",
-        "construction_wait_since", "construction_waited")
+        "construction_wait_since", "construction_waited",
+        # Stepwise v3 only: free-flow time of the links not yet
+        # traversed from the vehicle's current node onward. The
+        # session penalty bookkeeping updates it on every reroute
+        # and every completed link traversal, so reroute deltas
+        # telescope against the original-path FFTT (see session.py).
+        "remaining_fftt")
 
     def __init__(self, agent_id):
         self.agent_id = agent_id
@@ -212,6 +218,7 @@ class Vehicle:
         self.complete = False
         self.closed_original_links = []
         self.closed_fftt = f32(0)
+        self.remaining_fftt = 0.0
         self.construction_wait_since = None
         self.construction_waited = False
         self.sim_link_seq = 0
@@ -229,7 +236,8 @@ class DemandType:
 
 
 class World:
-    def __init__(self, input_dir, flow_model=2, random_seed=100):
+    def __init__(self, input_dir, flow_model=2, random_seed=100,
+                 session_mode=False):
         if flow_model not in (1, 2, 3):
             raise ProgramStop(
                 "pysim implements the queue-based flow models 1/2/3; "
@@ -255,14 +263,26 @@ class World:
         self.emissions_computed = False
         self.full_link_moe = None
         self.full_link_tdmoe = None
-        # Simulation window from the agent file itself: the
-        # earliest departure to the latest departure, horizon 300
-        # minutes later (the v1 construction horizon rule).
+        # Simulation window. In the v2 full run it comes from the
+        # agent file itself: the earliest departure to the latest
+        # departure, horizon 300 minutes later (the v1 construction
+        # horizon rule). In stepwise v3 mode there is no agent file
+        # and no known end: the clock starts at 0.0 and the horizon
+        # starts at 300 minutes, then grows dynamically as segments
+        # advance (see extend_horizon). end tracks the horizon in
+        # session mode, so the loader's post-end capacity relaxation
+        # and the shortest-path departure clamp never trigger early.
         self.start = 0
         self.end = 1440
         self.horizon = 1740
-        self._determine_demand_period()
-        self.horizon = self.end + 300
+        self.session_mode = session_mode
+        if session_mode:
+            self.start = 0
+            self.end = 300
+            self.horizon = 300
+        else:
+            self._determine_demand_period()
+            self.horizon = self.end + 300
         # assignment period grid (g_ReadAssignmentPeriodSettings)
         self._build_assignment_periods()
         # network containers
@@ -407,13 +427,41 @@ class World:
 
     # ----- input readers (bare v2) -----
 
-    def read_inputs(self):
+    def read_inputs(self, load_agents=True):
         self.well_rng = WellRng(self.random_seed)
         self._read_nodes()
         self._read_links()
         self._setup_merges()
         self._generate_zones()
-        self._read_agents()
+        if load_agents:
+            self._read_agents()
+
+    def extend_horizon(self, new_horizon):
+        # Grow the horizon in place, preserving everything already
+        # simulated. Only appends: each link's MOE list gains one
+        # fresh MinuteMOE per added minute, and the assignment
+        # grid is rebuilt from the same start, which preserves
+        # every interval index for times below the old horizon
+        # (the grid is a deterministic 15-minute walk from start,
+        # so extending it only appends new intervals after the
+        # old ones; the old tail entries, placeholder zeros for
+        # slots past the old horizon, become real interval
+        # numbers, which is the point of the extension). Never call
+        # Link.setup_moe here: it would wipe the queues, counters
+        # and MOE minutes already written. The caller (session.py)
+        # must also extend any SPNetwork td_time rows, which are
+        # sized by num_periods; this method updates num_periods
+        # first so the caller can see the new size.
+        if new_horizon <= self.horizon:
+            return
+        old_len = len(self.links[0].moe) if self.links else 0
+        self.horizon = new_horizon
+        self.end = new_horizon
+        self._build_assignment_periods()
+        extra = new_horizon + 1 - old_len
+        for link in self.links:
+            link.moe.extend(MinuteMOE() for _ in range(extra))
+            link.jam_time_stamp = f32(new_horizon)
 
     def _setup_merges(self):
         # merge identification over the incoming links at each link's

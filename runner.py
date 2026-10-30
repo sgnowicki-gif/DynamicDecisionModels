@@ -7,12 +7,14 @@
 import sys
 from pysim_construction import run_pysim_construction
 import pandas as pd
+from datetime import datetime, timedelta
+import random
 
 full_demand = pd.read_excel('SiouxFalls_net_DDMproj.xlsx', sheet_name = 'Full Demand')
 network_data = pd.read_excel('SiouxFalls_net_DDMproj.xlsx', sheet_name = 'SiouxFalls_net', skiprows = 7)
 link_data = pd.read_excel('SiouxFalls_net_DDMproj.xlsx', sheet_name = 'Link_Length')
 link_data['Capacity'] = link_data['number_of_lanes'] * link_data['lane_capacity_in_vhc_per_hour']
 
-
-
+project_start = datetime(2026, 7, 1, 0,0)
+project_end = datetime(2026, 9, 30, 0, 0)
 
