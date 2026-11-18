@@ -14,6 +14,7 @@ checkpointing.
 """
 
 from .average import average_state, medoid_session, weighted_average_state
+from .checkpoint import load_checkpoint, save_checkpoint
 from .network import Network, build_network
 
 __all__ = [
@@ -22,4 +23,6 @@ __all__ = [
     "weighted_average_state",
     "Network",
     "build_network",
+    "load_checkpoint",
+    "save_checkpoint",
 ]

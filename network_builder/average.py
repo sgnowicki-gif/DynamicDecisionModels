@@ -761,7 +761,14 @@ def weighted_average_state(sessions, weights=None, verbose=False):
             veh_copy = copy.deepcopy(veh)
             world.vehicles[aid] = veh_copy
         completed.add(aid)
-        added_aids.append(aid)
+        # A pruned donor id (veh is None) carries no Vehicle:
+        # it is recorded in completed / pruned_completed_ids
+        # above, but it must not join added_aids, which lists
+        # only vehicles added to world.vehicles and is later
+        # sorted by departure -- a pruned id there raised
+        # KeyError (SF slice merge: stale ids 148153..148268).
+        if veh is not None:
+            added_aids.append(aid)
 
     # In-system placement: aid -> [link_no, category], plus the
     # queue item that will be rebuilt into that link's queue.

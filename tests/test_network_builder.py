@@ -513,6 +513,36 @@ def test_prune_flag():
           % len(off_starts))
 
 
+# (16) pruned donor completed ids must not crash averaging
+def test_pruned_donor_completed():
+    # Regression: a donor session whose completed vehicles were
+    # pruned to ids only used to crash weighted_average_state with
+    # KeyError at the vehicle_order sort. The pruned donor id
+    # (veh is None) was appended to added_aids although no Vehicle
+    # was ever placed in world.vehicles. Found by SF slice testing
+    # (merge_traffic, stale ids 148153..148268, all pruned, none
+    # dropped): the swap/drop path was ruled out by instrumentation
+    # (no drop of an added aid fired in the whole run).
+    empty = toy_session([], {}, 60.0)
+    donor = toy_session(
+        [{"agent_id": i, "origin_node_id": 1,
+          "destination_node_id": 2, "departure_time_in_min": 5.0}
+         for i in (11, 12, 13, 14)], {}, 60.0)
+    assert donor.sim.completed == 4
+    assert prune_session(donor) == 4
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        avg = weighted_average_state([empty, donor], [0.75, 0.25])
+    check("16-pruned-donor", avg.sim.completed == 1
+          and avg.pruned_completed_ids == {11}
+          and completed_ids_all(avg) == {11}
+          and 11 not in avg.world.vehicles
+          and all(a in avg.world.vehicles
+                  for a in avg.world.vehicle_order),
+          "completed 1, pruned id 11 carried, vehicle_order "
+          "has no stale id")
+
+
 def main():
     tests = [test_project_validation, test_actions_and_duration,
              test_profiles_and_weighted_penalty,
@@ -520,7 +550,8 @@ def main():
              test_example_end_to_end, test_history_merging,
              test_cache, test_ids_and_pruning, test_kmeans,
              test_poisson, test_parallel_equivalence,
-             test_weighted_average, test_prune_flag]
+             test_weighted_average, test_prune_flag,
+             test_pruned_donor_completed]
     started = time.time()
     for fn in tests:
         print("== %s" % fn.__name__)

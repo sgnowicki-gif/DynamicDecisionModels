@@ -111,27 +111,34 @@ not completed at T. No terminal penalty number is invented;
 the penalty is applied at analysis time and is documented as
 large enough to force completion.
 
-Checkpointing and resume. Expansion is layered: all nodes at
+Checkpointing and resume (v2). Expansion is layered: all nodes at
 epoch k are expanded before any node at k+1, per-layer stats
 are logged, and nodes.csv/links.csv are rewritten after each
-layer (cumulative). With save_frontier=True, the frontier
-traffic states at each layer boundary are also pickled (with
-a printed size warning -- these pickles are large, because a
-v3 session carries per-minute MOE arrays that grow with the
-clock). Resume from a pickle is NOT implemented in v1: the
-pickle format is documented in README.md so a resume can be
-built on it, but without the frontier states (in memory or
-from pickle) a run cannot be resumed, and the CSVs alone are
-not enough, because traffic states are not in the CSVs.
+layer (cumulative). After every completed layer the whole
+resumable state is also written to a single file,
+output_dir/checkpoint.pkl (overwritten each layer; see
+checkpoint.py for the format, the input fingerprint and what
+is deliberately NOT stored -- the transition cache).
+build_network(resume_from=...) loads that file, validates its
+fingerprint against the current inputs, and continues the
+layer loop from the checkpoint epoch + 1 without recomputing
+completed layers. The v1 --save-frontier per-layer frontier
+pickles (frontier_epoch_*.pkl) are gone: that flag is now a
+no-op alias that prints a note saying checkpoint.pkl
+supersedes it, and stale frontier_epoch_*.pkl files in the
+output dir are deleted at the start of a run.
 """
 
 import copy
 import csv
 import json
 import os
-import pickle
 import time
 from concurrent.futures import ProcessPoolExecutor
+
+from .checkpoint import (build_state, fingerprint_from_objects,
+                         load_checkpoint, prepare_output_dir,
+                         projects_summary, save_checkpoint)
 
 from .demand import (count_epoch_agents, enumerate_profiles,
                      generate_epoch_agents, parse_start_date)
@@ -491,7 +498,8 @@ def build_network(network_dir, projects, demand, groups, start_date,
                   horizon=240, flow_model=2, random_seed=100, workers=0,
                   prune_unfinishable_starts=False, output_dir=None,
                   save_frontier=False, profiles=None, verbose=False,
-                  coords=None):
+                  coords=None, resume_from=None, fingerprint=None,
+                  k=None, kmeans_seed=None):
     """Expand the network layer by layer; returns a Network.
 
     projects: list of Project (see projects.py). demand: dict
@@ -502,8 +510,21 @@ def build_network(network_dir, projects, demand, groups, start_date,
     profiles (tests only; production always uses the full
     enumeration). When output_dir is given, nodes.csv, links.csv,
     groups.csv and run_report.json are rewritten after every
-    layer, and frontier pickles are written only when
-    save_frontier is True.
+    layer, and checkpoint.pkl is overwritten after every
+    completed layer (checkpointing is always on when output_dir
+    is given; there is no separate flag). save_frontier is kept
+    only as a backwards-compatible no-op: it prints a note that
+    checkpoint.pkl supersedes the v1 frontier pickles and
+    otherwise does nothing. resume_from: path to a checkpoint.pkl
+    from an earlier run; the run continues from the checkpoint
+    epoch + 1 after validating the checkpoint's fingerprint
+    against the current inputs (ValueError on any mismatch, on
+    a missing/corrupt checkpoint, or when the checkpoint epoch
+    is already >= horizon). fingerprint: a caller-computed
+    fingerprint string (the CLI passes one built from input
+    file bytes); when None it is computed here from the loaded
+    objects. k / kmeans_seed are recorded in the fingerprint
+    when known (the CLI passes them).
     """
     if not isinstance(horizon, int) or isinstance(horizon, bool) \
             or horizon < 1:
@@ -518,16 +539,37 @@ def build_network(network_dir, projects, demand, groups, start_date,
     sorted_groups = sorted(set(groups.values()))
     coords_for_output = coords
     if output_dir is not None:
-        os.makedirs(output_dir, exist_ok=True)
-    root_session = create_session(network_dir, flow_model=flow_model,
-                                  random_seed=random_seed)
-    root_status = initial_status(len(projects))
+        # Run-start housekeeping (see checkpoint.py
+        # prepare_output_dir): stale v1 frontier pickles and
+        # orphan checkpoint tmp files are deleted, and on a
+        # FRESH run a pre-existing checkpoint.pkl is renamed
+        # to checkpoint.stale.pkl so a run killed in layer 0
+        # leaves no stale checkpoint behind.
+        for action in prepare_output_dir(output_dir, resume_from):
+            if verbose:
+                print(action)
+    if save_frontier:
+        print("--save-frontier is superseded in v2: checkpoint.pkl "
+              "(one file, overwritten after every completed layer) "
+              "replaces the v1 frontier_epoch_*.pkl files; the flag "
+              "is accepted and ignored.")
+    if fingerprint is None:
+        fingerprint = fingerprint_from_objects(
+            projects, demand, groups, coords, network_dir, start_date,
+            horizon, flow_model, random_seed,
+            prune_unfinishable_starts, k, kmeans_seed,
+            profiles=profiles)
     nodes = {}
     nodes_by_key = {}
     links = []
     next_node_id = 0
     next_link_id = 0
     next_group_id = 1
+    layer_stats = []
+    totals = {"transitions_computed": 0, "cache_hits": 0,
+              "profile_runs": 0, "transition_seconds": 0.0,
+              "merges": 0, "transition_log": []}
+    start_epoch = 0
 
     def unfinished(status):
         return sum(1 for state, _r in status if state != "completed")
@@ -542,16 +584,132 @@ def build_network(network_dir, projects, demand, groups, start_date,
         next_node_id += 1
         return node
 
-    root = add_node(0, root_status, root_session, 1.0, 0)
+    if resume_from is not None:
+        state = load_checkpoint(resume_from)
+        if state["fingerprint"] != fingerprint:
+            raise ValueError(
+                "checkpoint fingerprint mismatch: the checkpoint "
+                "was built from different inputs/settings than the "
+                "current run (projects, demand, groups/coordinates, "
+                "network, start_date, flow_model, random_seed, "
+                "prune flag, k, kmeans seed, or profile override "
+                "changed). Refusing to resume; rerun from scratch "
+                "or resume with the original inputs.")
+        if state["start_date"] != start_date:
+            raise ValueError(
+                "checkpoint start_date %s does not match current "
+                "start_date %s" % (state["start_date"], start_date))
+        if state["projects_summary"] != projects_summary(projects):
+            raise ValueError(
+                "checkpoint projects do not match the current "
+                "projects file")
+        if state["epoch"] >= horizon:
+            raise ValueError(
+                "checkpoint is already at epoch %d, which is >= "
+                "horizon %d: nothing left to resume"
+                % (state["epoch"], horizon))
+        if state["epoch"] < 1:
+            raise ValueError(
+                "checkpoint epoch %r is not a completed layer "
+                "(checkpoints are written after a layer completes)"
+                % (state["epoch"],))
+        node_ids_seen = set()
+        for record in state["nodes"]:
+            for key in ("node_id", "epoch", "status",
+                        "reaching_weight", "group_id",
+                        "unfinished_count", "traffic"):
+                if key not in record:
+                    raise ValueError(
+                        "checkpoint node record is missing %r" % key)
+            if record["epoch"] > state["epoch"]:
+                raise ValueError(
+                    "checkpoint node %r is at epoch %d, past the "
+                    "checkpoint epoch %d"
+                    % (record["node_id"], record["epoch"],
+                       state["epoch"]))
+            # unfinished_count is only meaningful on terminal
+            # nodes. A restored node is terminal only if its
+            # epoch is the resumed horizon, which cannot happen
+            # here (every restored epoch is <= the checkpoint
+            # epoch, and the checkpoint epoch is < horizon, as
+            # checked above), so restored nodes carry None --
+            # exactly as in an uninterrupted run to this horizon.
+            # The stored value is kept in the checkpoint for
+            # provenance only.
+            node = _Node(record["node_id"], record["epoch"],
+                         record["status"], record["traffic"],
+                         record["reaching_weight"], record["group_id"],
+                         record["unfinished_count"]
+                         if record["epoch"] == horizon else None)
+            if node.node_id in nodes:
+                raise ValueError("checkpoint has duplicate node %r"
+                                 % (node.node_id,))
+            nodes[node.node_id] = node
+            nodes_by_key[(node.epoch, node.status)] = node
+            node_ids_seen.add(node.node_id)
+        frontier = [n for n in nodes.values()
+                    if n.epoch == state["epoch"]]
+        if not frontier:
+            raise ValueError(
+                "checkpoint has no nodes at its epoch %d"
+                % state["epoch"])
+        for record in state["links"]:
+            for key in ("link_id", "from_node", "to_node", "action",
+                        "branch_probability", "link_weight",
+                        "closed_set", "profile_count"):
+                if key not in record:
+                    raise ValueError(
+                        "checkpoint link record is missing %r" % key)
+            if record["from_node"] not in node_ids_seen \
+                    or record["to_node"] not in node_ids_seen:
+                raise ValueError(
+                    "checkpoint link %r references an unknown node"
+                    % (record["link_id"],))
+            links.append(_Link(
+                record["link_id"], record["from_node"],
+                record["to_node"], record["action"],
+                record["branch_probability"], record["link_weight"],
+                dict(record["closed_set"]), record["profile_count"]))
+        links.sort(key=lambda link: link.link_id)
+        next_node_id = state["next_node_id"]
+        next_link_id = state["next_link_id"]
+        next_group_id = state["next_group_id"]
+        if nodes and max(nodes) >= next_node_id:
+            raise ValueError("checkpoint next_node_id %d does not "
+                             "exceed the restored node ids"
+                             % next_node_id)
+        if links and max(l.link_id for l in links) >= next_link_id:
+            raise ValueError("checkpoint next_link_id %d does not "
+                             "exceed the restored link ids"
+                             % next_link_id)
+        if nodes and max(n.group_id for n in nodes.values()) \
+                >= next_group_id:
+            raise ValueError("checkpoint next_group_id %d does not "
+                             "exceed the restored group ids"
+                             % next_group_id)
+        totals = state["totals"]
+        layer_stats = state["layer_stats"]
+        if [s["epoch"] for s in layer_stats] != list(
+                range(state["epoch"])):
+            raise ValueError(
+                "checkpoint layer_stats do not cover epochs 0..%d"
+                % (state["epoch"] - 1,))
+        start_epoch = state["epoch"]
+        if verbose:
+            print("resumed from %s at epoch %d: %d nodes, %d links, "
+                  "%d transitions computed so far"
+                  % (resume_from, state["epoch"], len(nodes),
+                     len(links), totals["transitions_computed"]))
+    else:
+        root_session = create_session(network_dir, flow_model=flow_model,
+                                      random_seed=random_seed)
+        root_status = initial_status(len(projects))
+        add_node(0, root_status, root_session, 1.0, 0)
     cache = {}
-    layer_stats = []
-    totals = {"transitions_computed": 0, "cache_hits": 0,
-              "profile_runs": 0, "transition_seconds": 0.0,
-              "merges": 0, "transition_log": []}
     profile_list = profiles
     if profile_list is None:
         profile_list = enumerate_profiles(len(sorted_groups))
-    for epoch in range(horizon):
+    for epoch in range(start_epoch, horizon):
         layer_started = time.time()
         layer_nodes = [node for node in sorted(nodes.values(),
                                                key=lambda n: n.node_id)
@@ -675,22 +833,26 @@ def build_network(network_dir, projects, demand, groups, start_date,
             with open(os.path.join(layers_dir, "layer_%d.json" % epoch),
                       "w", encoding="utf-8") as fh:
                 json.dump(layer_stat, fh, indent=2)
-            if save_frontier:
-                frontier = [(node.node_id, node.epoch, node.status,
-                             node.reaching_weight, node.group_id,
-                             node.traffic)
-                            for node in sorted(nodes.values(),
-                                               key=lambda n: n.node_id)
-                            if node.epoch == epoch + 1]
-                frontier_path = os.path.join(
-                    output_dir, "frontier_epoch_%d.pkl" % (epoch + 1))
-                with open(frontier_path, "wb") as fh:
-                    pickle.dump({"epoch": epoch + 1,
-                                 "nodes": frontier}, fh)
-                size_mb = os.path.getsize(frontier_path) / 1e6
-                print("frontier pickle %s: %.1f MB (traffic states "
-                      "are large; see README resume limitations)"
-                      % (frontier_path, size_mb))
+            # Single latest checkpoint only: overwritten after
+            # every completed layer. The transition cache is
+            # deliberately NOT persisted (see checkpoint.py):
+            # resume recomputes transitions in the resumed
+            # layers, which cannot change the network (nodes,
+            # links, penalties, reaching weights), though
+            # recomputed group_ids may differ from an
+            # uninterrupted run and the wall-clock reporting
+            # counters (transition_seconds, transition_log
+            # seconds) always differ.
+            checkpoint_path = save_checkpoint(
+                output_dir,
+                build_state(epoch + 1, horizon, start_date,
+                            fingerprint, projects, nodes, links,
+                            next_node_id, next_link_id, next_group_id,
+                            totals, layer_stats))
+            if verbose:
+                print("checkpoint %s: epoch %d, %.1f MB"
+                      % (checkpoint_path, epoch + 1,
+                         os.path.getsize(checkpoint_path) / 1e6))
     network = Network(nodes, links, projects, horizon, start_date,
                       layer_stats, totals)
     if output_dir is not None:

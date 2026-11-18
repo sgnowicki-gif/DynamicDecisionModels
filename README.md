@@ -1,4 +1,10 @@
-# network_builder v1 — backwards-induction NETWORK construction (no solver)
+# network_builder v2 — backwards-induction NETWORK construction (no solver)
+
+v2 adds resume / checkpointing only (see "Resume /
+checkpointing" below). No v1 semantics change except the
+pruned-donor crash fix below (see "Fixed bug"): demand
+levels, Poisson ppf, k-means, merging, pruning, agent ids,
+cache key and penalty are exactly as in v1.
 
 Builds the layered network for Eli's Dynamic Decision Models
 backwards-induction analysis. This package constructs the
@@ -75,7 +81,7 @@ groups, group_coords = compute_groups(node_ids, coordinates=coords,
                                       k=4, seed=42)
 network = build_network(
     "sioux_falls_bare_inputs", projects, demand, groups,
-    "2026-11-02", horizon=240, output_dir="network_out",
+    "2026-07-06", horizon=240, output_dir="network_out",
     coords=group_coords)
 ```
 
@@ -87,7 +93,7 @@ python -m network_builder.cli \
     --projects my_projects.csv \
     --demand demand.csv \
     --coordinates original_input_node.csv \
-    --start-date 2026-11-02 \
+    --start-date 2026-07-06 \
     --horizon 240 \
     --output-dir network_out
 ```
@@ -103,8 +109,9 @@ precomputed groups file instead (tests/examples only).
 `--workers N` (N > 1) parallelises profiles with a
 ProcessPoolExecutor; the default (0/1) is sequential.
 `--prune-unfinishable-starts` enables the optional prune
-flag (default off, see below). `--save-frontier` pickles the
-frontier traffic states per layer (see "Checkpointing").
+flag (default off, see below). `--save-frontier` is accepted
+but ignored in v2 (checkpoint.pkl supersedes it; see
+"Resume / checkpointing").
 
 ## Locked specification
 
@@ -266,6 +273,27 @@ to the first session than the unweighted average; a single
 session returns a deepcopy; empty / mismatched / negative /
 sum-zero weights fail loud.
 
+Fixed bug (2026-11-17, found by SF slice testing, pre-existing
+v1 code, not a resume bug): a donor session whose completed
+vehicles had been pruned to ids only crashed
+weighted_average_state with KeyError at the vehicle_order
+sort. The pruned donor id (veh is None) was appended to
+added_aids although no Vehicle was ever placed in
+world.vehicles; in the SF merge 116 consecutive stale ids
+(148153..148268, all pruned, none dropped) hit the departure
+lookup. The fix is one guard in the donor-completed loop in
+average.py: append to added_aids only when a Vehicle was
+actually added; the pruned id is still recorded in completed
+/ pruned_completed_ids. The hypothesised swap/drop path was
+ruled out by instrumentation (no drop of an added aid fired).
+Regression test 16-pruned-donor in
+tests/test_network_builder.py reproduces the crash on the
+unfixed code (KeyError: 11) and passes with the fix. The SF
+2-project / 3-profile slice now completes horizon 2 (32
+nodes, 40 links, 9 merges), and the resumed horizon-1-to-2
+run matches the uninterrupted run exactly (nodes.csv,
+links.csv, transition penalties).
+
 ## Agent ids
 
 Scheme (see network_builder/ids.py for the full rationale,
@@ -403,7 +431,173 @@ per-transition log with epoch, from-node, action, penalty
 and seconds); layers/layer_<k>.json holds the same per-layer
 summary for layer k alone. Traffic
 states are NOT in the CSVs; access them in memory via
-node.traffic, or via the optional frontier pickles below.
+node.traffic, or resume from output_dir/checkpoint.pkl (see
+"Resume / checkpointing").
+
+## Resume / checkpointing (v2)
+
+v2 adds resume-from-checkpoint and changes nothing else
+except the pruned-donor crash fix below (see "Fixed bug"):
+no v1 semantics change (demand levels, Poisson ppf,
+k-means, merging, pruning, agent ids, cache key, penalty).
+What changed is only how a run survives being killed and
+restarts.
+
+Checkpoint granularity. ONE checkpoint file only:
+`checkpoint.pkl` in the output dir, overwritten after every
+completed LAYER (epoch). Never after a node or a branch, and
+there is no per-layer checkpoint history. A run killed
+mid-layer restarts from the last completed layer; the
+partial layer is recomputed from scratch.
+
+Why per-layer only: per-node/per-branch saving is
+prohibitively slow and large. Measured on the toy network,
+pickling one node costs 0.04-0.07 s and 0.27-0.38 MB, and
+pickling a whole epoch-2 frontier costs 0.45 s and 2.3 MB;
+a Sioux Falls session is already ~5.7 MB at 12 hours of
+clock and keeps growing (per-link per-minute MOE arrays
+grow with the clock), so saving after every node would
+multiply both the runtime and the disk footprint by the
+node count. Per-layer saving costs one frontier pickle per
+epoch and is the only granularity that stays affordable.
+
+What checkpoint.pkl contains. The frontier traffic sessions
+ONLY (the full session objects of every node at the
+completed epoch); nodes at earlier epochs are stored with
+traffic=None, because only frontier nodes are ever expanded
+again and write_outputs never touches a node's traffic --
+storing all sessions was the bulk of the checkpoint size
+for no benefit. All nodes metadata (id, epoch, status,
+reaching_weight, group_id, unfinished_count), all links
+(id, from, to, action, branch_probability, link_weight,
+closed_set, profile_count), the counters next_node_id /
+next_link_id / next_group_id, the totals dict, layer_stats,
+a projects summary, and an input fingerprint (below). The
+format is built by `network_builder/checkpoint.py`
+(`save_checkpoint(output_dir, state)` /
+`load_checkpoint(path)`); writes are atomic (temp file +
+os.replace), so a kill mid-write never leaves a
+half-written checkpoint behind. There is no fsync:
+process-kill resume is safe, but power-loss durability is
+NOT guaranteed. A kill mid-write leaves an orphan
+checkpoint.*.tmp file, deleted at the start of the next
+run. After a resume, non-frontier nodes in the returned
+in-memory Network carry traffic=None; on-disk outputs are
+unaffected (the CSVs never contain traffic).
+
+What it deliberately does NOT contain: the transition
+cache. The cache is memoisation only: dropping it cannot
+change the NETWORK -- nodes, links, penalties, reaching
+weights, unfinished counts and merged traffic states are
+identical to an uninterrupted run, because a recomputed
+transition runs the same profiles from the same stored
+session and produces the same penalty and averaged end
+state. What CAN differ is REPORTING, not the network:
+totals["transition_seconds"] and the per-entry "seconds"
+in totals["transition_log"] are wall-clock measurements,
+so they always differ between two runs (resumed or not).
+totals["transitions_computed"], "cache_hits",
+"profile_runs" and the length of "transition_log" differ
+only if a resumed layer would have hit a cache entry
+populated by an earlier, completed layer -- which needs
+the same (traffic_state_group_id, closed link set, day of
+week, starting hour) to recur across layers, and the
+(day, hour) pair recurs only every 28 epochs, so it
+cannot happen in short runs (verified identical on the
+toy resume tests, including a cache-hit resume test with
+5 large-project branches). One more thing CAN differ from
+an uninterrupted run: group_id values assigned to
+transitions recomputed in the resumed layers. group_id is
+only a cache key and a stored label, never part of node
+identity (identity is epoch + status) or of merging, so a
+different group_id on a resumed-layer node changes
+nothing downstream except the label itself. Nodes at or
+before the checkpoint epoch keep their group_ids exactly.
+
+How to resume. Finish stage 1, then rerun with the same
+inputs plus `--resume-from`:
+
+```
+python -m network_builder.cli \
+    --network-dir sioux_falls_bare_inputs \
+    --projects my_projects.csv \
+    --demand demand.csv \
+    --coordinates original_input_node.csv \
+    --start-date 2026-07-06 \
+    --horizon 240 \
+    --output-dir network_out \
+    --resume-from network_out/checkpoint.pkl
+```
+
+The CLI still loads projects/demand/groups from the CURRENT
+arguments, so the checkpoint fingerprint can be validated
+against them, and it passes the same network_dir/projects/
+demand/coordinates/start_date/horizon/flow_model/
+random_seed/workers/prune settings through. The Python API
+equivalent is `build_network(..., resume_from=<path>)`
+(plus an optional caller-computed `fingerprint=`; when
+omitted it is computed from the loaded objects). The
+example flow is `example_resume.py`: horizon 2, then
+resume to horizon 4 (29 nodes, 34 links, 30 transitions
+computed, 6 merges). Those counts are
+profile-count-independent, so they are checked with the
+full 9-profile k=2 enumeration in the example itself;
+full node/link/penalty equivalence against an
+uninterrupted run is verified in tests/test_resume.py --
+to horizon 4 with the 3-profile override, and to horizon
+2 with the full 9-profile enumeration. Sioux Falls slice
+equivalence was verified externally on the 2-project
+3-profile slice at horizon 2 only; no Sioux Falls
+full-profile equivalence is claimed anywhere.
+
+Fingerprint validation and fail-loud cases. The fingerprint
+is a SHA-256 over the builder inputs: the projects file
+bytes, the demand file bytes (if any), the groups /
+coordinates input identity (file bytes of whichever was
+given), the FULL bytes of both bare network files
+(input_node.csv and input_link.csv -- hashing only node
+ids and link from/to pairs would miss an edited link
+attribute such as length or speed, which pysim_construction
+reads into the stored sessions), start_date, flow_model,
+random_seed, the prune flag, k and the k-means seed (plus
+the test-only profile override, when one is used). The
+network directory PATH is deliberately not fingerprinted:
+identity comes from the file bytes, so moving an unchanged
+network to a new path resumes fine. Resume fails loud
+(ValueError, no partial network written) when: the
+fingerprint mismatches (any of those inputs changed -- a
+changed projects file, a changed start_date, a changed
+demand file, a changed network topology, a changed prune
+flag, and (via the CLI) a changed link attribute are the
+tested cases);
+the checkpoint file is missing or corrupt (bad pickle, or a
+pickled object of the wrong shape -- including a v1
+frontier pickle, which has no fingerprint and cannot be
+resumed); or the checkpoint epoch is already >= the
+requested horizon (nothing left to resume). Horizon itself
+is deliberately NOT part of the fingerprint, even though it
+is stored in the checkpoint: extending the horizon is the
+point of resume (build 2 epochs, resume to 4), so a
+fingerprint that included the horizon would make every
+extension fail; the epoch >= horizon rule is the horizon
+check. Checkpointing is always on when output_dir is
+given; there is no separate flag.
+
+`--save-frontier` (v1) is removed as behaviour and kept as
+a no-op alias: the flag is still accepted, prints a note
+that checkpoint.pkl supersedes the v1
+`frontier_epoch_*.pkl` files, and otherwise does nothing.
+Stale `frontier_epoch_*.pkl` files in the output dir are
+deleted at the start of a run, as are orphan
+`checkpoint.*.tmp` files left by a kill mid-write. A
+pre-existing `checkpoint.pkl` in the output dir is renamed
+to `checkpoint.stale.pkl` (preserved, not deleted) at the
+start of a FRESH run only, so a fresh run killed in layer 0
+leaves no stale checkpoint behind that could be mistaken
+for the new run's; on a resume the checkpoint is left
+alone. Add `network_out/` to `.gitignore` (checkpoints
+are large binary files and are regenerable from the inputs
+by rerunning).
 
 ## Layered expansion and checkpointing
 
@@ -411,21 +605,10 @@ Expansion is epoch by epoch: all nodes at epoch k are
 expanded before any node at k+1. Per-layer stats are logged
 (and printed with --verbose) and the outputs above are
 rewritten after each layer, so a killed run still leaves the
-layers completed so far on disk. With --save-frontier, the
-frontier traffic states at each layer boundary are also
-pickled to frontier_epoch_<k>.pkl, with a printed size
-warning. Resume limitations, stated honestly: v1 does NOT
-implement resume-from-pickle. The pickle format is
-{"epoch": k, "nodes": [(node_id, epoch, status,
-reaching_weight, group_id, traffic_session), ...]}, which a
-resume implementation could load and continue from, but
-without the frontier states -- in memory or from a pickle --
-a run cannot be resumed, and the CSVs alone are never
-enough, because traffic states are not in the CSVs. A
-resume would also need the exact builder inputs (network,
-projects, demand, groups, start_date, horizon, flow model,
-seed, workers, prune flag) and the cache/group-id counter
-state, which are not yet persisted.
+layers completed so far on disk. After each completed layer
+the single checkpoint.pkl is also overwritten (see "Resume /
+checkpointing" above). The CSVs alone are never enough to
+resume, because traffic states are not in the CSVs.
 
 ## Example mode (deliberate deviation, flagged)
 
@@ -526,16 +709,30 @@ extrapolate from his own slice, not from these numbers.
 ## Contents
 
 - network_builder/ -- the package: __init__.py, average.py
-  (weighted average_state), ids.py (ids, pruning,
+  (weighted average_state), checkpoint.py (v2: checkpoint
+  save/load, input fingerprint), ids.py (ids, pruning,
   renumbering, offsetting), demand.py (profiles, levels,
   Poisson ppf, generation), groups.py (k-means, groups
   files), projects.py (project CSV validation),
   network.py (nodes, actions, transitions, cache, merging,
-  layered expansion, outputs), cli.py, and
+  layered expansion, outputs, resume), cli.py, and
   pysim_construction/ (vendored v3, with its README.md).
 - example_project.csv, example_demand.csv,
   example_coordinates.csv, example_network/
-  (input_node.csv, input_link.csv), example_run.py.
-- tests/test_network_builder.py -- the test suite (16
+  (input_node.csv, input_link.csv), example_run.py,
+  example_resume.py (v2: horizon 2, then resume to 4).
+- tests/test_network_builder.py -- the v1 test suite (16
   areas; see the test file for the mapping to the brief).
+- tests/test_resume.py -- the v2 resume tests: toy
+  resume-vs-uninterrupted equivalence (horizon 2 then
+  resume to 4, 3-profile override; plus a full 9-profile
+  equivalence to horizon 2), a cache-hit resume test
+  (5 large-project branches), fingerprint mismatch
+  (start date, demand, projects, network topology, prune
+  flag, and a CLI link-attribute change), missing/corrupt
+  checkpoint (including malformed totals and duplicate
+  node keys), checkpoint epoch >= horizon, next_group_id
+  validation, frontier-only checkpoint sessions,
+  stale-checkpoint rename and orphan-tmp cleanup on a
+  fresh run, and single-file checkpoint overwrite.
 - This README.md.

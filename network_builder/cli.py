@@ -6,10 +6,29 @@ Example (Sioux Falls, real geometry, synthetic projects)::
         --network-dir sioux_falls_bare_inputs \
         --projects my_projects.csv \
         --demand demand.csv \
-        --coordinates input_node_original.csv \
-        --start-date 2026-11-02 \
+        --coordinates original_input_node.csv \
+        --start-date 2026-07-06 \
         --horizon 240 \
         --output-dir network_out
+
+Resume a run from its checkpoint (see README "Resume /
+checkpointing")::
+
+    python -m network_builder.cli \
+        --network-dir sioux_falls_bare_inputs \
+        --projects my_projects.csv \
+        --demand demand.csv \
+        --coordinates original_input_node.csv \
+        --start-date 2026-07-06 \
+        --horizon 240 \
+        --output-dir network_out \
+        --resume-from network_out/checkpoint.pkl
+
+The resume command reloads projects/demand/groups from the
+CURRENT arguments, so the checkpoint fingerprint can be
+validated against them; any change fails loud. 2026-07-06
+(the first Monday in July 2026) is the start_date used in
+the documentation and examples.
 
 Without --demand the network is built with zero demand (the
 structure, actions, branches and merging are still exercised;
@@ -24,6 +43,7 @@ import json
 import sys
 import time
 
+from .checkpoint import fingerprint_from_files
 from .demand import load_demand
 from .groups import compute_groups, load_coordinates
 from .network import build_network, read_bare_network
@@ -61,8 +81,16 @@ def main(argv=None):
     parser.add_argument("--prune-unfinishable-starts", action="store_true")
     parser.add_argument("--allow-out-of-range-durations",
                         action="store_true")
-    parser.add_argument("--save-frontier", action="store_true")
+    parser.add_argument("--save-frontier", action="store_true",
+                        help="accepted for backwards compatibility; "
+                             "v2 ignores it (checkpoint.pkl "
+                             "supersedes the v1 frontier pickles)")
     parser.add_argument("--output-dir", required=True)
+    parser.add_argument("--resume-from", default=None,
+                        help="path to a checkpoint.pkl from an "
+                             "earlier run; resumes from the "
+                             "checkpoint epoch + 1 after validating "
+                             "the input fingerprint")
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args(argv)
     _nodes, link_set = read_bare_network(args.network_dir)
@@ -77,6 +105,16 @@ def main(argv=None):
     groups, group_coords = compute_groups(
         node_ids, coordinates=coords, groups_file=args.groups_file,
         k=args.k, seed=args.kmeans_seed)
+    # The fingerprint is built from the input FILE bytes (plus
+    # settings and the bare network contents), so a resume fails
+    # loud if any input file changed since the checkpoint was
+    # written -- even a change that parses to the same projects.
+    fingerprint = fingerprint_from_files(
+        args.projects, args.demand, args.coordinates,
+        args.groups_file, args.network_dir,
+        args.start_date, args.horizon, args.flow_model,
+        args.random_seed, args.prune_unfinishable_starts, args.k,
+        args.kmeans_seed)
     started = time.time()
     network = build_network(
         args.network_dir, projects, demand, groups, args.start_date,
@@ -84,7 +122,9 @@ def main(argv=None):
         random_seed=args.random_seed, workers=args.workers,
         prune_unfinishable_starts=args.prune_unfinishable_starts,
         output_dir=args.output_dir, save_frontier=args.save_frontier,
-        verbose=args.verbose, coords=group_coords)
+        verbose=args.verbose, coords=group_coords,
+        resume_from=args.resume_from, fingerprint=fingerprint,
+        k=args.k, kmeans_seed=args.kmeans_seed)
     elapsed = time.time() - started
     print("nodes: %d, links: %d, epochs: %d, elapsed: %.1fs"
           % (len(network.nodes), len(network.links), args.horizon,
