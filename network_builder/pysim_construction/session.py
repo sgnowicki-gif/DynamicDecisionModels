@@ -5,7 +5,8 @@
 # session object IS the resume state: it holds the world (nodes,
 # links with their loading/entrance/exit queues, flow counters,
 # cumulative counters, ring buffers, prevailing and
-# departure-based travel times, and per-link MOE), the simulator
+# departure-based travel times -- v3 stores no per-link MOE
+# history; link.moe is None, see network.py), the simulator
 # (origin-waiting dict, generated/completed counts, departure
 # buckets, prevailing-time shortest-path network), every vehicle
 # (link sequence, arrival stamps, leaving-buffer time, original
@@ -23,12 +24,13 @@ from .closures import SegmentClosures
 from .cpp import f32
 from .loading import SIM_INTERVAL, Simulator
 from .network import Vehicle, VehicleLink, World
-from .sp import find_best_path
+from .sp import find_best_path, find_best_path_cached
 
 _EPS = 1e-9
 
 
-def create_session(network_dir, flow_model=2, random_seed=100):
+def create_session(network_dir, flow_model=2, random_seed=100,
+                   path_cache=True):
     """Create a stepwise session from a bare network directory.
 
     network_dir holds input_node.csv and input_link.csv only,
@@ -59,6 +61,10 @@ def create_session(network_dir, flow_model=2, random_seed=100):
                   random_seed=random_seed, session_mode=True)
     world.read_inputs(load_agents=False)
     sim = Simulator(world, construction=None)
+    # v3: the admission / reroute path cache lives on the
+    # prevailing-time network; disabling it here disables it for
+    # the whole session (deepcopies inherit the flag).
+    sim.prevailing_net._path_cache_enabled = bool(path_cache)
     return Session(network_dir, world, sim, flow_model, random_seed)
 
 
@@ -441,7 +447,7 @@ def run_segment(session, agents, closed_links, step_minutes):
         # the info-updating flag), so it is the right graph
         # for both the original path and the barred-avoiding
         # reroutes the loader computes from it.
-        node_size, path_links, _ = find_best_path(
+        node_size, path_links, _ = find_best_path_cached(
             world, sim.prevailing_net, veh.origin_zone,
             veh.origin_node, veh.departure, veh.dest_zone,
             veh.dest_node, veh.demand_type, veh.vot)

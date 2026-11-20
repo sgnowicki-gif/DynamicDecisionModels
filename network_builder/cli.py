@@ -79,6 +79,15 @@ def main(argv=None):
                         help="0/1 = sequential, >1 = ProcessPool over "
                              "profiles")
     parser.add_argument("--prune-unfinishable-starts", action="store_true")
+    parser.add_argument("--no-path-cache", action="store_true",
+                        help="disable the v3 admission/reroute path "
+                             "cache (spot checks only; penalties must "
+                             "match the cached run exactly)")
+    parser.add_argument("--no-worker-prune", action="store_true",
+                        help="do not prune completed vehicles in "
+                             "profile end sessions before averaging "
+                             "(spot checks only; penalties must match "
+                             "the pruned run)")
     parser.add_argument("--allow-out-of-range-durations",
                         action="store_true")
     parser.add_argument("--save-frontier", action="store_true",
@@ -114,7 +123,8 @@ def main(argv=None):
         args.groups_file, args.network_dir,
         args.start_date, args.horizon, args.flow_model,
         args.random_seed, args.prune_unfinishable_starts, args.k,
-        args.kmeans_seed)
+        args.kmeans_seed, path_cache=not args.no_path_cache,
+        worker_prune=not args.no_worker_prune)
     started = time.time()
     network = build_network(
         args.network_dir, projects, demand, groups, args.start_date,
@@ -124,7 +134,9 @@ def main(argv=None):
         output_dir=args.output_dir, save_frontier=args.save_frontier,
         verbose=args.verbose, coords=group_coords,
         resume_from=args.resume_from, fingerprint=fingerprint,
-        k=args.k, kmeans_seed=args.kmeans_seed)
+        k=args.k, kmeans_seed=args.kmeans_seed,
+        path_cache=not args.no_path_cache,
+        worker_prune=not args.no_worker_prune)
     elapsed = time.time() - started
     print("nodes: %d, links: %d, epochs: %d, elapsed: %.1fs"
           % (len(network.nodes), len(network.links), args.horizon,

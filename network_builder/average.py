@@ -4,7 +4,9 @@ Weighted extension (network_builder). This copy adds
 weighted_average_state(sessions, weights), where weights are
 normalised to sum 1 and every mean in the original algorithm
 (medoid feature mean, category targets, link counters, MOE
-and travel times) becomes a weighted mean. average_state is
+and travel times) becomes a weighted mean. v3 stores no MOE
+history (``link.moe`` is None), so the MOE mean is skipped;
+everything else is averaged exactly as before. average_state is
 kept as the unweighted wrapper: equal weights reproduce the
 original behaviour exactly (the returned average_info gains
 one extra key, "weights"). The copy also accepts pruned
@@ -87,9 +89,9 @@ total in-system (the adjustment goes to the category with the
 largest mean total). The on-link target per link is the sum of
 its entrance and exit targets, not a separately rounded number,
 so on-link and queue targets cannot disagree. Waiting and
-completed targets are the rounded means. Mean ``prevailing_tt``
-per link, mean MOE per link per minute up to ``now``, and mean
-generated/completed are computed alongside.
+completed targets are the rounded means. Mean ``prevailing_tt`` per link and mean
+generated/completed are computed alongside. (v3 stores no MOE
+history, so no mean MOE is computed; see step E.)
 
 D. Adjustment from the medoid base toward the targets. Counters
 are never just overwritten; vehicles are actually moved, added
@@ -155,12 +157,16 @@ equals ``cflow_arrival`` (every bare-mode agent is type 1).
 means, ``departure_count`` to its rounded mean, and
 ``buffer_waiting_time`` to its mean; the prevailing-time
 shortest-path network is then rebuilt from the mean
-``prevailing_tt`` values. MOE history is the mean MOE up to
-``now``, except the current-minute cumulative values, which are
-set to the synthesised ``cflow`` counters at ``now``, and the
-current-minute exit queue length, which is set to the placed
-exit queue length. Minutes after ``now`` keep the medoid values
-(they are unwritten). ``td_map`` is the medoid's, with removed
+``prevailing_tt`` values (the rebuild clears the v3 path
+cache, so the rebuilt network's paths are recomputed from
+the new prevailing times). MOE history: v3 stores none
+(``link.moe`` is None on every session), so the MOE
+averaging loop is skipped; on a session that does carry MOE
+the loop still runs as before (mean MOE up to ``now``,
+current-minute cumulative values synthesised from the
+``cflow`` counters at ``now``, current-minute exit queue
+length set to the placed exit queue length, minutes after
+``now`` keeping the medoid values). ``td_map`` is the medoid's, with removed
 vehicles taken out and added vehicles inserted in their
 departure buckets; this is correct because ``run_segment``
 appends new agents' buckets to ``td_map`` rather than
@@ -216,11 +222,14 @@ the gap is the expected nonlinearity of queueing and rerouting,
 not a defect, unless a feasibility check fails. (2) Synthetic
 arrival stamps from moved vehicles anchor those vehicles'
 future link travel times, so their future traversal penalties
-carry that approximation. (3) MOE minutes before ``now`` are
-means, not the history of any real run, and the current-minute
-cumulative values are synthesised; MOE is diagnostic in bare
-mode and does not drive the resumed dynamics (the prevailing
-network carries free-flow times for information-type-1 agents).
+carry that approximation. (3) v3 stores no MOE history at all, so no link-level
+performance can be recovered from a v3 session; MOE was
+diagnostic in bare mode and does not drive the resumed
+dynamics (the prevailing network carries free-flow times for
+information-type-1 agents). On a session that does carry MOE,
+minutes before ``now`` are means, not the history of any real
+run, and the current-minute cumulative values are
+synthesised.
 (4) Link RNG states, generation RNG state and merge counters
 are kept from the medoid; they are not averaged, because
 averaging RNG state is meaningless. (5) Sessions with
@@ -947,7 +956,8 @@ def weighted_average_state(sessions, weights=None, verbose=False):
                 "loaded vehicle %d is in no queue after averaging"
                 % aid)
 
-    # Link state: counters, MOE, travel times, capacities.
+    # Link state: counters, travel times, capacities
+    # (MOE skipped in v3 -- see the guard below).
     now_minute = int(avg.now)
     actual_counts = cell_counts()
     link_targets = {}
@@ -1009,6 +1019,16 @@ def weighted_average_state(sessions, weights=None, verbose=False):
         vtype[1] += link.cflow_arrival - sum(vtype)
         link.counts_demand = demand
         link.counts_vtype = vtype
+        # v3 stores no MOE history (link.moe is None on every
+        # session): the per-minute MOE averaging loop below is
+        # skipped. MOE was never read downstream -- the averaged
+        # MOE history was diagnostic only -- so skipping it
+        # changes no penalty and no future state. Guarded, not
+        # deleted, so a session that does carry MOE (for
+        # example one built by older engine code) is still
+        # averaged exactly as before.
+        if link.moe is None:
+            continue
         for t in range(len(link.moe)):
             if t > now_minute:
                 continue  # unwritten minutes keep medoid values

@@ -114,6 +114,17 @@ class Link:
         # DTALink::SetupMOE (DTALite.h:2203): FFTT is (re)computed here, at
         # network read and again at the start of every loading. The
         # departure-based travel time total restarts at the FFTT.
+        # v3 stores NO per-link per-minute MOE history: link.moe stays
+        # None. MOE was write-only in the live builder path (its only
+        # reads are travel_time_by_min / link_speed / arrival_flow /
+        # departure_flow, none of which the builder's segment path
+        # uses, and the averaging loop, which is skipped when moe is
+        # None), so removing the allocation changes no penalty or
+        # state -- it only drops ~31% of stored-session RAM and the
+        # MOE averaging loop. The write sites in loading.py and the
+        # readers below all guard on `moe is None`. prevailing_tt
+        # needs no fallback: it is set to FFTT here and never
+        # updated in bare mode, so it already IS FFTT.
         self.fftt = f32(self.length / self.speed_limit * f32(60.0))
         self.prevailing_tt = self.fftt
         self.departure_based_tt = self.fftt
@@ -122,11 +133,7 @@ class Link:
         # with float arithmetic until the final division by the double 0.1
         self.backward_wave_steps = int(
             float(f32(f32(self.length / self.wave_speed) * f32(60))) / 0.1)
-        # Drop the previous list before building the new one: the old MOE
-        # values are dead at rebuild, and holding both lists at once
-        # doubles peak memory (one list per link per minute).
         self.moe = None
-        self.moe = [MinuteMOE() for _ in range(horizon + 1)]
         self.ring_arrival = [f32(0)] * 301
         self.ring_departure = [f32(0)] * 301
         self.loading_buffer.clear()
@@ -391,6 +398,11 @@ class World:
     def travel_time_by_min(self, link, start_time, interval):
         # DTALink::GetTravelTimeByMin (DTALite.h:2473), non-BPR branch:
         # windowed MOE average floored at the free-flow travel time.
+        # v3: link.moe is None, so there is no window to average;
+        # return FFTT, exactly what the total_flow < 1 branch
+        # returned before.
+        if link.moe is None:
+            return link.fftt
         start_time = max(0, int(start_time))
         time_end = min(start_time + interval, self.horizon)
         total_tt = f32(0)
@@ -412,6 +424,9 @@ class World:
 
     def arrival_flow(self, link, time, aggregation=1):
         # DTALink::GetArrivalFlow (DTALite.h:2396)
+        # v3: link.moe is None, so no cumulative counts exist.
+        if link.moe is None:
+            return 0
         time = max(0, time)
         if time + aggregation < self.horizon - 1:
             return max(0, link.moe[time + aggregation].cum_arrival -
@@ -419,6 +434,9 @@ class World:
         return 0
 
     def departure_flow(self, link, time, aggregation=1):
+        # v3: link.moe is None, so no cumulative counts exist.
+        if link.moe is None:
+            return 0
         time = max(0, time)
         if time + aggregation < self.horizon - 1:
             return max(0, link.moe[time + aggregation].cum_departure -
@@ -454,13 +472,20 @@ class World:
         # first so the caller can see the new size.
         if new_horizon <= self.horizon:
             return
-        old_len = len(self.links[0].moe) if self.links else 0
+        # v3: link.moe is None (no MOE history is stored), so there
+        # is no MOE list to extend; the horizon and the assignment
+        # grid still grow, and the caller still extends the
+        # SPNetwork td_time rows.
+        old_len = (len(self.links[0].moe)
+                   if self.links and self.links[0].moe is not None
+                   else 0)
         self.horizon = new_horizon
         self.end = new_horizon
         self._build_assignment_periods()
         extra = new_horizon + 1 - old_len
         for link in self.links:
-            link.moe.extend(MinuteMOE() for _ in range(extra))
+            if link.moe is not None:
+                link.moe.extend(MinuteMOE() for _ in range(extra))
             link.jam_time_stamp = f32(new_horizon)
 
     def _setup_merges(self):

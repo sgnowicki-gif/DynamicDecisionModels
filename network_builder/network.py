@@ -48,9 +48,10 @@ traffic state and penalty, differing only in construction
 remaining and branch probability = P(duration outcome). A
 do-nothing action creates one next node. Branch sharing is
 mandatory: the branch nodes initially reference the same
-session object, and no later step mutates a stored session in
-place (transitions always deepcopy before running, merging
-replaces the reference).
+session (v3: the same session KEY in the session store, not
+the same object in RAM), and no later step mutates a stored
+session in place (transitions always deepcopy before running,
+merging replaces the reference).
 
 History merging. When a transition leads to an existing
 (epoch, status) node, the traffic states merge:
@@ -141,12 +142,14 @@ from .checkpoint import (build_state, fingerprint_from_objects,
                          projects_summary, save_checkpoint)
 
 from .demand import (count_epoch_agents, enumerate_profiles,
-                     generate_epoch_agents, parse_start_date)
+                     generate_epoch_agents, parse_start_date,
+                     prepare_epoch_demand)
 from .groups import compute_groups, save_groups_csv
 from .ids import (next_agent_id_base, offset_session, prune_session,
                   renumber_session)
 from .projects import load_projects
 from .average import weighted_average_state
+from .session_store import SESSIONS_DIRNAME, SessionStore
 
 try:
     from .pysim_construction import create_session, run_segment
@@ -298,14 +301,24 @@ def apply_status(status, projects, action_name, action_project,
 
 
 def _profile_worker(job):
-    session, agents, closed_links, step_minutes = job
+    # v3: the worker prunes completed vehicles before returning,
+    # so the return pickle shrinks from ~22 MB to ~5.8 MB per
+    # profile (MOE-less: less still) and the parent receives
+    # ~0.47 GB per transition instead of ~1.8 GB at 81 profiles.
+    # Pruning is safe here because weighted_average_state accepts
+    # pruned sessions and the segment penalty is computed live,
+    # never from the completed list; the sequential path prunes
+    # identically below, so sequential and parallel stay exact.
+    session, agents, closed_links, step_minutes, prune = job
     result = run_segment(session, agents, closed_links, step_minutes)
+    if prune:
+        prune_session(result["state"])
     return result["penalty"], result["state"]
 
 
 def compute_transition(source_session, closed_links, demand, origin_group,
                        sorted_groups, epoch, start_dow, workers=0,
-                       profiles=None, stats=None):
+                       profiles=None, stats=None, worker_prune=True):
     """Run one transition: all profiles, weighted average, cleanup.
 
     Returns (weighted_penalty, stored_session) where the stored
@@ -314,6 +327,12 @@ def compute_transition(source_session, closed_links, demand, origin_group,
     id-only set). stats, when given, is a dict updated with
     profile_runs and seconds. profiles may override the default
     enumeration for tests (a list of (levels, probability)).
+    worker_prune prunes each profile end session before it is
+    averaged (in the worker before return when parallel, inline
+    when sequential); disable it only for the v2 comparison
+    spot check (--no-worker-prune). The OD list and level
+    counts are precomputed once per transition (epoch_ctx) and
+    shared by every profile's count/generate call.
     """
     if profiles is None:
         profiles = enumerate_profiles(len(sorted_groups))
@@ -322,8 +341,11 @@ def compute_transition(source_session, closed_links, demand, origin_group,
         raise ValueError("profile probabilities sum to %r, not 1"
                          % total_prob)
     base = next_agent_id_base(source_session)
+    epoch_ctx = prepare_epoch_demand(demand, origin_group,
+                                     sorted_groups, epoch, start_dow)
     counts = [count_epoch_agents(demand, origin_group, sorted_groups,
-                                 levels, epoch, start_dow)
+                                 levels, epoch, start_dow,
+                                 epoch_ctx=epoch_ctx)
               for levels, _prob in profiles]
     stride = max(counts) + 1000 if counts else 1000
     started = time.time()
@@ -335,9 +357,10 @@ def compute_transition(source_session, closed_links, demand, origin_group,
                 zip(profiles, counts)):
             agents = generate_epoch_agents(
                 demand, origin_group, sorted_groups, levels, epoch,
-                start_dow, base, stride, index)
+                start_dow, base, stride, index, epoch_ctx=epoch_ctx)
             jobs.append((copy.deepcopy(source_session), agents,
-                         dict(closed_links), float(EPOCH_MINUTES)))
+                         dict(closed_links), float(EPOCH_MINUTES),
+                         bool(worker_prune)))
         with ProcessPoolExecutor(max_workers=workers) as pool:
             results = list(pool.map(_profile_worker, jobs))
         for penalty, end_session in results:
@@ -348,13 +371,15 @@ def compute_transition(source_session, closed_links, demand, origin_group,
                 zip(profiles, counts)):
             agents = generate_epoch_agents(
                 demand, origin_group, sorted_groups, levels, epoch,
-                start_dow, base, stride, index)
+                start_dow, base, stride, index, epoch_ctx=epoch_ctx)
             session_copy = copy.deepcopy(source_session)
             result = run_segment(session_copy, agents, dict(closed_links),
                                  float(EPOCH_MINUTES))
             if sorted(result.keys()) != ["penalty", "state"]:
                 raise ValueError("run_segment returned unexpected keys "
                                  "%s" % (sorted(result.keys()),))
+            if worker_prune:
+                prune_session(result["state"])
             penalties.append(result["penalty"])
             end_sessions.append(result["state"])
     weighted_penalty = sum(prob * penalty
@@ -401,12 +426,21 @@ def merge_traffic(existing_session, incoming_session,
 
 
 class _Node:
+    # v3: traffic is the in-memory session or None; traffic_key
+    # is the disk-spill key in the session store or None. A node
+    # holds traffic in memory only transiently -- while it is
+    # being expanded or merged into. Between layers (and after a
+    # resume) only the key is kept, and the session is loaded on
+    # demand with Network.traffic_of. A node whose session is
+    # dead (already expanded, or never a frontier node) has
+    # both None.
     def __init__(self, node_id, epoch, status, traffic, reaching_weight,
-                 group_id, unfinished_count):
+                 group_id, unfinished_count, traffic_key=None):
         self.node_id = node_id
         self.epoch = epoch
         self.status = status
         self.traffic = traffic
+        self.traffic_key = traffic_key
         self.reaching_weight = reaching_weight
         self.group_id = group_id
         self.unfinished_count = unfinished_count
@@ -430,7 +464,7 @@ class Network:
     """In-memory backwards-induction network (nodes, links, stats)."""
 
     def __init__(self, nodes, links, projects, horizon, start_date,
-                 layer_stats, totals):
+                 layer_stats, totals, session_store=None):
         self.nodes = nodes
         self.links = links
         self.projects = projects
@@ -438,6 +472,33 @@ class Network:
         self.start_date = start_date
         self.layer_stats = layer_stats
         self.totals = totals
+        self.session_store = session_store
+
+    def traffic_of(self, node):
+        """Load a node's traffic session on demand (v3).
+
+        Returns the session, caching it in node.traffic. A node
+        with no live session (already expanded, or never a
+        frontier node) fails loud. Callers that only need the
+        network structure (CSVs, counts, penalties) never call
+        this, so a returned Network holds almost no session
+        data in RAM. The cached copy stays in node.traffic
+        until the caller drops it; the builder itself drops it
+        after every expansion.
+        """
+        if node.traffic is not None:
+            return node.traffic
+        if node.traffic_key is None:
+            raise ValueError(
+                "node %d (epoch %d) has no traffic session: it was "
+                "already expanded, or it was never a frontier node"
+                % (node.node_id, node.epoch))
+        if self.session_store is None:
+            raise ValueError(
+                "node %d has a session key but this Network has no "
+                "session store" % node.node_id)
+        node.traffic = self.session_store.get(node.traffic_key)
+        return node.traffic
 
     def nodes_at(self, epoch):
         return [node for node in self.nodes.values()
@@ -499,7 +560,8 @@ def build_network(network_dir, projects, demand, groups, start_date,
                   prune_unfinishable_starts=False, output_dir=None,
                   save_frontier=False, profiles=None, verbose=False,
                   coords=None, resume_from=None, fingerprint=None,
-                  k=None, kmeans_seed=None):
+                  k=None, kmeans_seed=None, path_cache=True,
+                  worker_prune=True):
     """Expand the network layer by layer; returns a Network.
 
     projects: list of Project (see projects.py). demand: dict
@@ -558,7 +620,17 @@ def build_network(network_dir, projects, demand, groups, start_date,
             projects, demand, groups, coords, network_dir, start_date,
             horizon, flow_model, random_seed,
             prune_unfinishable_starts, k, kmeans_seed,
-            profiles=profiles)
+            profiles=profiles, path_cache=path_cache,
+            worker_prune=worker_prune)
+    # v3 session store: disk-backed under output_dir/sessions/
+    # when an output dir is given, in-memory otherwise. Every
+    # node session is spilled here and loaded on demand; see
+    # session_store.py. Resume into a different output dir
+    # copies the checkpoint's sessions/ over first (below).
+    if output_dir is not None:
+        store = SessionStore(os.path.join(output_dir, SESSIONS_DIRNAME))
+    else:
+        store = SessionStore(None)
     nodes = {}
     nodes_by_key = {}
     links = []
@@ -574,18 +646,39 @@ def build_network(network_dir, projects, demand, groups, start_date,
     def unfinished(status):
         return sum(1 for state, _r in status if state != "completed")
 
-    def add_node(epoch, status, traffic, reaching, group_id):
+    def add_node(epoch, status, traffic, reaching, group_id,
+                 traffic_key=None):
         nonlocal next_node_id
         node = _Node(next_node_id, epoch, status, traffic, reaching,
                      group_id,
-                     unfinished(status) if epoch == horizon else None)
+                     unfinished(status) if epoch == horizon else None,
+                     traffic_key=traffic_key)
         nodes[next_node_id] = node
         nodes_by_key[(epoch, status)] = node
         next_node_id += 1
         return node
 
     if resume_from is not None:
+        if output_dir is None:
+            raise ValueError(
+                "resume needs an output_dir: the spilled sessions "
+                "live under <output_dir>/sessions/ and cannot be "
+                "restored into an in-memory-only build")
+        # Resuming into a different output dir than the
+        # checkpoint's: copy the checkpoint's sessions/ over
+        # first, so the resumed run owns its files. Same dir
+        # is a no-op (copy_from skips it).
+        ckpt_dir = os.path.dirname(os.path.abspath(resume_from))
+        copied = store.copy_from(
+            os.path.join(ckpt_dir, SESSIONS_DIRNAME))
+        if verbose and copied:
+            print("copied %d spilled session files from %s"
+                  % (copied, ckpt_dir))
         state = load_checkpoint(resume_from)
+        store.restore_state(state["session_store"])
+        swept = store.sweep_orphans()
+        if verbose and swept:
+            print("swept %d orphan spilled session files" % swept)
         if state["fingerprint"] != fingerprint:
             raise ValueError(
                 "checkpoint fingerprint mismatch: the checkpoint "
@@ -617,10 +710,17 @@ def build_network(network_dir, projects, demand, groups, start_date,
         for record in state["nodes"]:
             for key in ("node_id", "epoch", "status",
                         "reaching_weight", "group_id",
-                        "unfinished_count", "traffic"):
+                        "unfinished_count", "traffic_key"):
                 if key not in record:
                     raise ValueError(
                         "checkpoint node record is missing %r" % key)
+            if record["traffic_key"] is not None and \
+                    not store.has(record["traffic_key"]):
+                raise ValueError(
+                    "checkpoint node %r references session key %r, "
+                    "which is not in the session store (sessions/ "
+                    "directory incomplete?)"
+                    % (record["node_id"], record["traffic_key"]))
             if record["epoch"] > state["epoch"]:
                 raise ValueError(
                     "checkpoint node %r is at epoch %d, past the "
@@ -636,11 +736,14 @@ def build_network(network_dir, projects, demand, groups, start_date,
             # exactly as in an uninterrupted run to this horizon.
             # The stored value is kept in the checkpoint for
             # provenance only.
+            # v3: traffic stays None until first expanded (loaded
+            # on demand from the session store by traffic_key).
             node = _Node(record["node_id"], record["epoch"],
-                         record["status"], record["traffic"],
+                         record["status"], None,
                          record["reaching_weight"], record["group_id"],
                          record["unfinished_count"]
-                         if record["epoch"] == horizon else None)
+                         if record["epoch"] == horizon else None,
+                         traffic_key=record["traffic_key"])
             if node.node_id in nodes:
                 raise ValueError("checkpoint has duplicate node %r"
                                  % (node.node_id,))
@@ -702,9 +805,52 @@ def build_network(network_dir, projects, demand, groups, start_date,
                      len(links), totals["transitions_computed"]))
     else:
         root_session = create_session(network_dir, flow_model=flow_model,
-                                      random_seed=random_seed)
+                                      random_seed=random_seed,
+                                      path_cache=path_cache)
         root_status = initial_status(len(projects))
-        add_node(0, root_status, root_session, 1.0, 0)
+        # Spill the root session at once: the root node holds a
+        # key, not the session, like every other node.
+        root_key = store.put(root_session)
+        store.add_ref(root_key)
+        add_node(0, root_status, None, 1.0, 0, traffic_key=root_key)
+    # Spill discipline helpers (v3). A node's traffic lives in
+    # RAM only while the node is being expanded or merged into;
+    # at all other times only its session-store key is kept.
+    def load_traffic(node):
+        if node.traffic is None:
+            if node.traffic_key is None:
+                raise ValueError(
+                    "node %d (epoch %d) has no traffic session to "
+                    "expand" % (node.node_id, node.epoch))
+            node.traffic = store.get(node.traffic_key)
+        return node.traffic
+
+    def release_traffic(node):
+        # Drop the in-memory copy and the node's reference.
+        # Sibling branch nodes sharing the key keep theirs, so
+        # the file is deleted only when the last holder lets go.
+        if node.traffic_key is not None:
+            store.release(node.traffic_key)
+            node.traffic_key = None
+        node.traffic = None
+
+    def attach_session(node, session_key):
+        # Point a node at an already-spilled session (shared by
+        # branch siblings of one transition): add the node's
+        # reference, keep no in-memory copy.
+        store.add_ref(session_key)
+        node.traffic_key = session_key
+        node.traffic = None
+
+    def replace_traffic(node, session):
+        # Spill a fresh (merged) session over the node's old one.
+        if node.traffic_key is not None:
+            store.release(node.traffic_key)
+        key = store.put(session)
+        store.add_ref(key)
+        node.traffic_key = key
+        node.traffic = None
+
     cache = {}
     profile_list = profiles
     if profile_list is None:
@@ -721,6 +867,7 @@ def build_network(network_dir, projects, demand, groups, start_date,
         dow = (start_dow + epoch // 4) % 7
         epoch_hour = (epoch * 6) % 24
         for node in layer_nodes:
+            load_traffic(node)
             for action_name, project in available_actions(
                     node.status, projects, epoch, horizon,
                     prune_unfinishable_starts):
@@ -749,8 +896,12 @@ def build_network(network_dir, projects, demand, groups, start_date,
                 action_label = "do_nothing" if action_name == "do_nothing" \
                     else project.project_id
                 if cache_key in cache:
-                    penalty, end_session, group_id = cache[cache_key]
-                    end_session = copy.deepcopy(end_session)
+                    # Disk-backed cache: the entry holds a session
+                    # key, not the session; loading it is a fresh
+                    # unpickle, equivalent to the v2 deepcopy.
+                    penalty, end_key, group_id, _created = \
+                        cache[cache_key]
+                    end_session = store.get(end_key)
                     layer_hits += 1
                     totals["cache_hits"] += 1
                 else:
@@ -758,10 +909,19 @@ def build_network(network_dir, projects, demand, groups, start_date,
                     penalty, end_session = compute_transition(
                         node.traffic, closed, demand, groups,
                         sorted_groups, epoch, start_dow, workers=workers,
-                        profiles=profile_list, stats=stats)
+                        profiles=profile_list, stats=stats,
+                        worker_prune=worker_prune)
                     group_id = next_group_id
                     next_group_id += 1
-                    cache[cache_key] = (penalty, end_session, group_id)
+                    # Spill the end session once per transition;
+                    # every branch node below attaches to this key.
+                    # The cache holds one reference of its own, so
+                    # the file survives even if every branch node
+                    # is merged away before the next layer.
+                    end_key = store.put(end_session)
+                    store.cache_hold(end_key)
+                    cache[cache_key] = (penalty, end_key, group_id,
+                                        epoch)
                     layer_computed += 1
                     totals["transitions_computed"] += 1
                     totals["profile_runs"] += stats.get("profile_runs", 0)
@@ -790,14 +950,16 @@ def build_network(network_dir, projects, demand, groups, start_date,
                             duration * EPOCH_MINUTES
                     if target_key not in nodes_by_key:
                         target = add_node(epoch + 1, new_status,
-                                          end_session, incoming_path,
+                                          None, incoming_path,
                                           group_id)
+                        attach_session(target, end_key)
                     else:
                         target = nodes_by_key[target_key]
+                        load_traffic(target)
                         merged = merge_traffic(
                             target.traffic, end_session,
                             target.reaching_weight, incoming_path)
-                        target.traffic = merged
+                        replace_traffic(target, merged)
                         target.reaching_weight += incoming_path
                         target.group_id = next_group_id
                         next_group_id += 1
@@ -808,6 +970,22 @@ def build_network(network_dir, projects, demand, groups, start_date,
                         action_label, branch_prob, penalty,
                         link_closed, len(profile_list)))
                     next_link_id += 1
+            # The node's session is dead after its actions: drop
+            # the in-memory copy and the node's reference. (Its
+            # branch siblings keep theirs.)
+            release_traffic(node)
+        # Cache entries are usable only in the layer after the
+        # one that created them (branch nodes share a group_id
+        # only with their siblings in the next layer), so drop
+        # entries from earlier layers now. Entries created in
+        # this layer stay for the next layer. Dropping a cache
+        # entry releases its reference; the session file is
+        # deleted only if no node still points at it.
+        for ckey in list(cache):
+            _pen, ekey, _gid, created = cache[ckey]
+            if created < epoch:
+                store.cache_release(ekey)
+                del cache[ckey]
         layer_stat = {"epoch": epoch,
                       "nodes_at_epoch": len(layer_nodes),
                       "actions": layer_actions,
@@ -826,7 +1004,8 @@ def build_network(network_dir, projects, demand, groups, start_date,
                      layer_stat["seconds"]))
         if output_dir is not None:
             network = Network(nodes, links, projects, horizon,
-                              start_date, layer_stats, totals)
+                              start_date, layer_stats, totals,
+                              session_store=store)
             network.write_outputs(output_dir, groups, coords_for_output)
             layers_dir = os.path.join(output_dir, "layers")
             os.makedirs(layers_dir, exist_ok=True)
@@ -848,13 +1027,14 @@ def build_network(network_dir, projects, demand, groups, start_date,
                 build_state(epoch + 1, horizon, start_date,
                             fingerprint, projects, nodes, links,
                             next_node_id, next_link_id, next_group_id,
-                            totals, layer_stats))
+                            totals, layer_stats,
+                            session_store_state=store.checkpoint_state()))
             if verbose:
                 print("checkpoint %s: epoch %d, %.1f MB"
                       % (checkpoint_path, epoch + 1,
                          os.path.getsize(checkpoint_path) / 1e6))
     network = Network(nodes, links, projects, horizon, start_date,
-                      layer_stats, totals)
+                      layer_stats, totals, session_store=store)
     if output_dir is not None:
         network.write_outputs(output_dir, groups, coords_for_output)
     return network

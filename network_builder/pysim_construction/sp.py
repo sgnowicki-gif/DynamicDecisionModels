@@ -16,6 +16,20 @@ class SPNetwork:
         for link in world.links:
             row = [f32(0.01)] * n_intervals
             self.td_time.append(row)
+        # v3 path cache (see find_best_path_cached below). The cache
+        # lives on the network object, so it is per session: two
+        # sessions never share cached paths, and a deepcopy of a
+        # session carries its own copy. _path_cache_enabled is the
+        # operator switch (--no-path-cache); _path_cache_ok is
+        # None until the td_time uniformity check has run for the
+        # current td_time, True when every link's row is uniform
+        # (so the shortest path cannot depend on departure time),
+        # False otherwise. rebuild() clears the cache and resets
+        # the check; update_current_travel_time() disables it,
+        # because prevailing times then vary by interval.
+        self._path_cache = {}
+        self._path_cache_ok = None
+        self._path_cache_enabled = True
         self.rebuild(use_prevailing, current_time)
 
     def rebuild(self, use_prevailing, current_time):
@@ -39,6 +53,10 @@ class SPNetwork:
                     avg = f32(0.01)
                 self.td_time[link.link_no][idx] = avg
                 t += world.interval_length(t)
+        # The TD table changed: cached paths are stale until the
+        # uniformity check re-runs for the new table.
+        self._path_cache = {}
+        self._path_cache_ok = None
 
     def update_current_travel_time(self, current_time):
         # DTANetworkForSP::UpdateCurrentTravelTime: refresh TD times from
@@ -54,6 +72,33 @@ class SPNetwork:
                     avg = f32(0.01)
                 self.td_time[link.link_no][idx] = avg
             t = f32(t + f32(world.interval_length(t)))
+        # Intervals before current_time keep old values while later
+        # intervals were refreshed, so the table is no longer
+        # uniform across intervals: disable the path cache.
+        self._path_cache = {}
+        self._path_cache_ok = False
+
+    def _verify_path_cache(self):
+        # True iff every link's TD row holds a single value, so a
+        # shortest path depends only on (origin, destination,
+        # barred set) and not on departure time. Runs once per
+        # TD table; the result is cached in _path_cache_ok.
+        if self._path_cache_ok is not None:
+            return self._path_cache_ok
+        ok = True
+        for row in self.td_time:
+            if not row:
+                ok = False
+                break
+            first = row[0]
+            for value in row[1:]:
+                if value != first:
+                    ok = False
+                    break
+            if not ok:
+                break
+        self._path_cache_ok = ok
+        return ok
 
 
 def find_best_path(world, net, origin_zone, origin, departure_time,
@@ -149,3 +194,58 @@ def find_best_path(world, net, origin_zone, origin, departure_time,
         pred = pred_node[pred]
     path_links = list(reversed(reversed_links))
     return len(path_links) + 1, path_links, total_cost
+
+
+def find_best_path_cached(world, net, origin_zone, origin, departure_time,
+                          destination_zone, destination, demand_type, vot,
+                          barred=None):
+    """Cached find_best_path, safe by construction.
+
+    In bare mode the TD table is uniform per link (prevailing_tt
+    == FFTT for every link and the info-updating flag is False,
+    so prevailing times never change mid-run), which makes a
+    Dijkstra result depend only on (origin, destination, barred
+    set) -- not on departure time. This wrapper caches the path
+    (not the cost: the cost is recomputed from the uniform TD
+    row on a hit) under that key, but ONLY after verifying the
+    table really is uniform: _verify_path_cache scans the rows
+    once per TD table, and any rebuild or prevailing-time update
+    clears the cache and forces a re-check. If the table is not
+    uniform, or the cache is disabled (--no-path-cache), this
+    falls back to an uncached find_best_path call, so a future
+    info-type change can never silently reuse a stale path.
+    The cache lives on the SPNetwork object, so it is per
+    session; the key also carries the origin/destination zones
+    (connector-link filtering), demand_type and vot, and the
+    barred-link frozenset.
+    """
+    if not getattr(net, "_path_cache_enabled", True):
+        return find_best_path(world, net, origin_zone, origin,
+                              departure_time, destination_zone,
+                              destination, demand_type, vot, barred=barred)
+    if not net._verify_path_cache():
+        return find_best_path(world, net, origin_zone, origin,
+                              departure_time, destination_zone,
+                              destination, demand_type, vot, barred=barred)
+    if vot <= 0.01:
+        vot_key = 1
+    else:
+        vot_key = float(vot)
+    key = (origin, destination, origin_zone, destination_zone,
+           demand_type, vot_key,
+           frozenset(barred) if barred else frozenset())
+    hit = net._path_cache.get(key)
+    if hit is not None:
+        node_size, path_links = hit
+        if node_size < 2 or not path_links:
+            return 0, [], f32(0)
+        interval = world.interval_index(departure_time)
+        total = f32(0)
+        for link_no in path_links:
+            total = f32(total + net.td_time[link_no][interval])
+        return node_size, list(path_links), total
+    node_size, path_links, total_cost = find_best_path(
+        world, net, origin_zone, origin, departure_time,
+        destination_zone, destination, demand_type, vot, barred=barred)
+    net._path_cache[key] = (node_size, list(path_links))
+    return node_size, path_links, total_cost

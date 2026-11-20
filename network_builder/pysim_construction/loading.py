@@ -7,7 +7,7 @@ import numpy as np
 
 from .cpp import f32, floating_less, less_eq
 from .network import VehicleLink
-from .sp import SPNetwork, find_best_path
+from .sp import SPNetwork, find_best_path, find_best_path_cached
 
 SIM_INTERVAL = 0.1  # g_DTASimulationInterval (double)
 
@@ -74,7 +74,7 @@ class Simulator:
         # Belt-and-braces validation: a returned path must be
         # non-empty, contain only real links, and run from the
         # starting node to the destination, otherwise it is no path.
-        node_size, path_links, cost = find_best_path(
+        node_size, path_links, cost = find_best_path_cached(
             self.world, self.prevailing_net, veh.origin_zone,
             starting_node, veh.departure, veh.dest_zone, veh.dest_node,
             veh.demand_type, veh.vot, barred=self._barred())
@@ -185,7 +185,7 @@ class Simulator:
                 world.gen_rng.ratio()  # pVeh->GetRandomRatio() draw, unused
                 if veh.node_size != 0:
                     continue
-                node_size, path_links, _ = find_best_path(
+                node_size, path_links, _ = find_best_path_cached(
                     world, net, veh.origin_zone, veh.origin_node,
                     veh.departure, veh.dest_zone, veh.dest_node,
                     veh.demand_type, veh.vot)
@@ -227,7 +227,7 @@ class Simulator:
             stamps = []
             link_count = 0
             updated = []
-        node_size, path_links, _ = find_best_path(
+        node_size, path_links, _ = find_best_path_cached(
             world, self.prevailing_net, veh.origin_zone, starting_node,
             veh.departure, veh.dest_zone, veh.dest_node, veh.demand_type,
             veh.vot, barred=self._barred())
@@ -262,7 +262,7 @@ class Simulator:
         starting_node = world.links[current_link].to_id
         current_path = [entry.link_no for entry in veh.link_ary[:-1]]
         stamps = [entry.abs_arrival for entry in veh.link_ary[:-1]]
-        node_size, sub_links, _ = find_best_path(
+        node_size, sub_links, _ = find_best_path_cached(
             world, self.prevailing_net, veh.origin_zone, starting_node,
             veh.departure, veh.dest_zone, veh.dest_node, veh.demand_type,
             veh.vot, barred=self._barred())
@@ -410,6 +410,8 @@ class Simulator:
     def _post_loading(self):
         world = self.world
         for link in world.links:
+            if link.moe is None:
+                continue  # v3 stores no MOE history (link.moe is None)
             # "remove data holes": forward cumulative-max pass over the
             # cumulative arrival/departure counts (simulation.cpp:2148).
             # The pass must reach the horizon index itself: LinkTDMOE and
@@ -718,7 +720,8 @@ class Simulator:
         for link in links:
             link.ring_arrival[slot] = f32(link.cflow_arrival)
             link.ring_departure[slot] = f32(link.cflow_departure)
-            if step_no % 10 == 0 and time_stamp < world.horizon + 1:
+            if step_no % 10 == 0 and time_stamp < world.horizon + 1 \
+                    and link.moe is not None:
                 moe = link.moe[time_stamp]
                 moe.exit_queue_length = len(link.exit_queue)
                 moe.cum_arrival = link.cflow_arrival
@@ -836,7 +839,8 @@ class Simulator:
                     next_link.counts_demand[veh.demand_type] += 1
                     next_link.counts_vtype[veh.vehicle_type] += 1
                     link.cflow_departure += 1
-                    if t_link_arrival < world.horizon + 1:
+                    if link.moe is not None and \
+                            t_link_arrival < world.horizon + 1:
                         moe = link.moe[t_link_arrival]
                         moe.total_travel_time = f32(
                             moe.total_travel_time + travel_time)
@@ -877,7 +881,8 @@ class Simulator:
                 link.departure_count += 1
                 link.departure_based_tt = f32(
                     link.departure_based_tt + travel_time)
-                if t_link_arrival < world.horizon + 1:
+                if link.moe is not None and \
+                        t_link_arrival < world.horizon + 1:
                     moe = link.moe[t_link_arrival]
                     moe.total_travel_time = f32(
                         moe.total_travel_time + travel_time)

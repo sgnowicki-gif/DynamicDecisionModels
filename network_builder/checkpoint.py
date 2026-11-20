@@ -7,24 +7,41 @@ completed layer (epoch). No per-layer checkpoint history, no
 is gone; see network.py). A run killed mid-layer restarts from
 the last completed layer; the partial layer is recomputed.
 
+v3 (FORMAT_VERSION 3). The checkpoint no longer embeds the
+frontier sessions: sessions live in per-session pickle files
+under <output_dir>/sessions/ (see session_store.py), and the
+checkpoint stores each frontier node's session KEY plus the
+store's reference counts ("session_store"). A v2 checkpoint
+fails loud here (format_version 2 != 3): v2 sessions carry
+MOE history and v2 checkpoints embed sessions inline, so a
+v2 checkpoint can never be resumed into v3 code -- fresh
+restart is the plan. The fingerprint also carries the v3
+engine flags (moe_removed, sessions_spilled, path_cache,
+worker_prune), so resuming with a different engine setting
+fails loud instead of silently mixing.
+
 What a checkpoint contains (minimum to restart exactly):
-frontier traffic sessions ONLY -- the full session objects
-of the nodes at the completed epoch, and traffic=None for
-every node at an earlier epoch. Only frontier nodes are
+frontier traffic sessions ONLY -- in v3, the session KEY of
+each node at the completed epoch (the session itself lives
+in <output_dir>/sessions/sess_<key>.pkl), and traffic_key=None
+for every node at an earlier epoch. Only frontier nodes are
 ever expanded again, and write_outputs never touches a
 node's traffic, so the older sessions are dead weight (a
 Sioux Falls checkpoint was already ~58 MB at epoch 1 with
-all nodes' sessions stored). All nodes metadata (id, epoch,
+all nodes' sessions stored; a v3 checkpoint is kilobytes
+plus the sessions/ directory). All nodes metadata (id, epoch,
 status, reaching_weight, group_id, unfinished_count), all
 links (id, from, to, action, branch_probability, link_weight,
 closed_set, profile_count), the counters next_node_id /
 next_link_id / next_group_id, the totals dict, layer_stats,
+the session store state (next_key and node reference counts),
 and an input fingerprint (see below). The checkpoint also
 carries a projects summary so resume can check the project
 list itself matches, not just its file hash. Note the
 in-memory consequence: after a resume, non-frontier nodes
-in the returned Network carry traffic=None; only frontier
-nodes (and nodes created in resumed layers) hold sessions.
+in the returned Network carry traffic=None and traffic_key=None;
+frontier nodes carry traffic_key set and traffic=None until
+first expanded (loaded on demand via Network.traffic_of).
 On-disk outputs are unaffected (the CSVs never contain
 traffic).
 
@@ -112,7 +129,7 @@ import os
 import pickle
 import tempfile
 
-FORMAT_VERSION = 2
+FORMAT_VERSION = 3
 CHECKPOINT_FILENAME = "checkpoint.pkl"
 
 
@@ -163,7 +180,8 @@ def network_files_sha256(network_dir):
 def fingerprint_from_files(projects_path, demand_path, coordinates_path,
                            groups_file_path, network_dir, start_date,
                            horizon, flow_model, random_seed,
-                           prune_unfinishable_starts, k, kmeans_seed):
+                           prune_unfinishable_starts, k, kmeans_seed,
+                           path_cache=True, worker_prune=True):
     """Fingerprint for the CLI path: hashes of input file bytes.
 
     demand_path / coordinates_path / groups_file_path may be
@@ -195,6 +213,13 @@ def fingerprint_from_files(projects_path, demand_path, coordinates_path,
         "prune_unfinishable_starts": bool(prune_unfinishable_starts),
         "k": k,
         "kmeans_seed": kmeans_seed,
+        # v3 engine flags: a resume with a different engine
+        # setting fails loud instead of silently mixing (a v2
+        # checkpoint fails earlier, on format_version).
+        "moe_removed": True,
+        "sessions_spilled": True,
+        "path_cache": bool(path_cache),
+        "worker_prune": bool(worker_prune),
     }
     return make_fingerprint(parts)
 
@@ -203,7 +228,8 @@ def fingerprint_from_objects(projects, demand, groups, coords,
                              network_dir, start_date,
                              horizon, flow_model, random_seed,
                              prune_unfinishable_starts, k, kmeans_seed,
-                             profiles=None):
+                             profiles=None, path_cache=True,
+                             worker_prune=True):
     """Fingerprint for the direct-API path: loaded objects.
 
     projects: list of Project; demand: {(o, d, dow, h): vph};
@@ -237,6 +263,10 @@ def fingerprint_from_objects(projects, demand, groups, coords,
         "prune_unfinishable_starts": bool(prune_unfinishable_starts),
         "k": k,
         "kmeans_seed": kmeans_seed,
+        "moe_removed": True,
+        "sessions_spilled": True,
+        "path_cache": bool(path_cache),
+        "worker_prune": bool(worker_prune),
         "profiles": (None if profiles is None else
                      [[list(levels), float(prob)]
                       for levels, prob in profiles]),
@@ -256,7 +286,8 @@ def projects_summary(projects):
 
 def build_state(epoch, horizon, start_date, fingerprint, projects,
                 nodes, links, next_node_id, next_link_id,
-                next_group_id, totals, layer_stats):
+                next_group_id, totals, layer_stats,
+                session_store_state=None):
     """Assemble the checkpoint state dict from live builder data.
 
     nodes: dict node_id -> _Node (with .traffic sessions); links:
@@ -281,7 +312,11 @@ def build_state(epoch, horizon, start_date, fingerprint, projects,
             "reaching_weight": node.reaching_weight,
             "group_id": node.group_id,
             "unfinished_count": node.unfinished_count,
-            "traffic": node.traffic if node.epoch == epoch else None,
+            # v3: the session KEY, not the session. Only nodes AT
+            # the checkpoint epoch (the frontier) keep a key;
+            # earlier nodes are stored with traffic_key=None.
+            "traffic_key": (node.traffic_key
+                            if node.epoch == epoch else None),
         })
     link_records = []
     for link in links:
@@ -309,6 +344,9 @@ def build_state(epoch, horizon, start_date, fingerprint, projects,
         "next_group_id": next_group_id,
         "totals": totals,
         "layer_stats": layer_stats,
+        # v3: the session store state (next_key + node
+        # reference counts) so a resume can rebuild the store.
+        "session_store": session_store_state,
     }
 
 
@@ -351,6 +389,16 @@ def prepare_output_dir(output_dir, resume_from=None):
             stale_path = os.path.join(output_dir, "checkpoint.stale.pkl")
             os.replace(ckpt, stale_path)
             actions.append("renamed %s to %s" % (ckpt, stale_path))
+        # v3: a fresh run owns its sessions/ directory. Spilled
+        # sessions from an earlier run in this dir belong to the
+        # stale checkpoint and must not be mistaken for this
+        # run's (keys restart at 1). On a resume the directory
+        # is left alone: it IS the resume source.
+        import shutil
+        sessions_dir = os.path.join(output_dir, "sessions")
+        if os.path.isdir(sessions_dir):
+            shutil.rmtree(sessions_dir)
+            actions.append("deleted stale %s" % sessions_dir)
     return actions
 
 
@@ -363,7 +411,7 @@ def save_checkpoint(output_dir, state):
     required = ("format_version", "epoch", "horizon", "start_date",
                 "fingerprint", "projects_summary", "nodes", "links",
                 "next_node_id", "next_link_id", "next_group_id",
-                "totals", "layer_stats")
+                "totals", "layer_stats", "session_store")
     if not isinstance(state, dict):
         raise ValueError("checkpoint state must be a dict")
     missing = [key for key in required if key not in state]
@@ -414,16 +462,24 @@ def load_checkpoint(path):
     required = ("format_version", "epoch", "horizon", "start_date",
                 "fingerprint", "projects_summary", "nodes", "links",
                 "next_node_id", "next_link_id", "next_group_id",
-                "totals", "layer_stats")
+                "totals", "layer_stats", "session_store")
     missing = [key for key in required if key not in state]
     if missing:
         raise ValueError("checkpoint file %s is missing keys: %s"
                          % (path, missing))
     if state["format_version"] != FORMAT_VERSION:
         raise ValueError("checkpoint file %s has format_version %r, "
-                         "expected %d (v1 frontier pickles cannot be "
-                         "resumed)" % (path, state["format_version"],
-                                       FORMAT_VERSION))
+                         "expected %d (v1 frontier pickles and v2 "
+                         "checkpoints cannot be resumed into v3: "
+                         "v2 sessions carry MOE history and embed "
+                         "sessions inline -- restart fresh)"
+                         % (path, state["format_version"],
+                            FORMAT_VERSION))
+    if not isinstance(state["session_store"], dict) \
+            or "next_key" not in state["session_store"] \
+            or "refcounts" not in state["session_store"]:
+        raise ValueError("checkpoint file %s has a bad session_store "
+                         "state" % path)
     if not isinstance(state["epoch"], int) \
             or isinstance(state["epoch"], bool):
         raise ValueError("checkpoint file %s has a bad epoch %r"

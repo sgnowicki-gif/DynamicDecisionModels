@@ -290,38 +290,93 @@ def level_count(level, base):
     raise ValueError("unknown demand level %r" % (level,))
 
 
-def count_epoch_agents(demand, origin_group, sorted_groups, levels,
-                       epoch, start_dow):
-    """Total agents in one epoch for one profile, without building them.
+_LEVEL_INDEX = {"low": 0, "medium": 1, "high": 2}
 
-    Same counting rules as generate_epoch_agents (level per origin
-    group, hourly base for the epoch's day, missing rows = 0).
-    Used to size the profile id stride before generation.
+
+def prepare_epoch_demand(demand, origin_group, sorted_groups, epoch,
+                         start_dow):
+    """Precompute the per-epoch demand tables once per transition.
+
+    v3: count_epoch_agents and generate_epoch_agents used to each
+    rebuild the sorted OD set from all demand keys and recompute
+    the per-level counts (including the Poisson ppf) for every
+    profile -- 2 * n_profiles rebuilds per transition over a
+    ~96k-key demand dict. This builds the tables once: the
+    sorted OD list, each OD's group position, and, for each of
+    the epoch's 6 hours with base > 0, the (low, medium, high)
+    counts. Returns a dict (the "epoch ctx") that count /
+    generate accept as epoch_ctx=; passing None builds it
+    inline, so direct callers are unaffected. The tables are
+    read-only: count and generate only read them.
     """
-    if len(levels) != len(sorted_groups):
-        raise ValueError("levels %r do not match %d groups"
-                         % (levels, len(sorted_groups)))
+    if len(sorted_groups) < 1:
+        raise ValueError("sorted_groups must be non-empty")
     group_pos = {group: i for i, group in enumerate(sorted_groups)}
     day_index = epoch // 4
     dow = (start_dow + day_index) % 7
-    total = 0
+    entries = []
     for (origin, dest) in sorted({(o, d) for (o, d, _w, _h)
                                   in demand}):
         if origin not in origin_group:
             raise ValueError("demand origin %d has no group assignment"
                              % origin)
-        level = levels[group_pos[origin_group[origin]]]
+        hours = []
         for hour_offset in range(6):
             hour_of_day = (epoch * 6 + hour_offset) % 24
             base = demand.get((origin, dest, dow, hour_of_day), 0.0)
             if base > 0:
-                total += level_count(level, base)
+                hours.append((hour_offset,
+                              level_count("low", base),
+                              level_count("medium", base),
+                              level_count("high", base)))
+        entries.append((origin, dest,
+                        group_pos[origin_group[origin]], hours))
+    return {"epoch": epoch, "start_dow": start_dow, "dow": dow,
+            "sorted_groups": list(sorted_groups), "entries": entries}
+
+
+def _check_epoch_ctx(epoch_ctx, sorted_groups, epoch, start_dow):
+    if epoch_ctx["epoch"] != epoch \
+            or epoch_ctx["start_dow"] != start_dow \
+            or list(epoch_ctx["sorted_groups"]) != list(sorted_groups):
+        raise ValueError(
+            "epoch_ctx was prepared for epoch %r / start_dow %r / "
+            "groups %r, not epoch %r / start_dow %r / groups %r"
+            % (epoch_ctx["epoch"], epoch_ctx["start_dow"],
+               epoch_ctx["sorted_groups"], epoch, start_dow,
+               sorted_groups))
+
+
+def count_epoch_agents(demand, origin_group, sorted_groups, levels,
+                       epoch, start_dow, epoch_ctx=None):
+    """Total agents in one epoch for one profile, without building them.
+
+    Same counting rules as generate_epoch_agents (level per origin
+    group, hourly base for the epoch's day, missing rows = 0).
+    Used to size the profile id stride before generation.
+    epoch_ctx, when given, is a prepare_epoch_demand table for
+    this epoch (built once per transition by the caller); when
+    None it is built here.
+    """
+    if len(levels) != len(sorted_groups):
+        raise ValueError("levels %r do not match %d groups"
+                         % (levels, len(sorted_groups)))
+    if epoch_ctx is None:
+        epoch_ctx = prepare_epoch_demand(demand, origin_group,
+                                         sorted_groups, epoch, start_dow)
+    else:
+        _check_epoch_ctx(epoch_ctx, sorted_groups, epoch, start_dow)
+    total = 0
+    for _origin, _dest, group_index, hours in epoch_ctx["entries"]:
+        level_index = _LEVEL_INDEX[levels[group_index]]
+        for hour in hours:
+            total += hour[1 + level_index]
     return total
 
 
 def generate_epoch_agents(demand, origin_group, sorted_groups, levels,
                           epoch, start_dow, id_base, stride,
-                          profile_index):
+                          profile_index, epoch_ctx=None):
     """Generate one profile's agents for one epoch.
 
     demand: dict from load_demand. origin_group: origin node id ->
@@ -339,22 +394,18 @@ def generate_epoch_agents(demand, origin_group, sorted_groups, levels,
     if len(levels) != len(sorted_groups):
         raise ValueError("levels %r do not match %d groups"
                          % (levels, len(sorted_groups)))
-    group_pos = {group: i for i, group in enumerate(sorted_groups)}
+    if epoch_ctx is None:
+        epoch_ctx = prepare_epoch_demand(demand, origin_group,
+                                         sorted_groups, epoch, start_dow)
+    else:
+        _check_epoch_ctx(epoch_ctx, sorted_groups, epoch, start_dow)
     epoch_start = epoch * 360
-    day_index = epoch // 4
-    dow = (start_dow + day_index) % 7
     agents = []
     counter = 0
-    for (origin, dest) in sorted({(o, d) for (o, d, _w, _h)
-                                  in demand}):
-        if origin not in origin_group:
-            raise ValueError("demand origin %d has no group assignment"
-                             % origin)
-        level = levels[group_pos[origin_group[origin]]]
-        for hour_offset in range(6):
-            hour_of_day = (epoch * 6 + hour_offset) % 24
-            base = demand.get((origin, dest, dow, hour_of_day), 0.0)
-            count = level_count(level, base) if base > 0 else 0
+    for (origin, dest, group_index, hours) in epoch_ctx["entries"]:
+        level_index = _LEVEL_INDEX[levels[group_index]]
+        for hour_offset, low, medium, high in hours:
+            count = (low, medium, high)[level_index]
             hour_start = epoch_start + hour_offset * 60
             for i in range(count):
                 departure = hour_start + i * 60.0 / count
