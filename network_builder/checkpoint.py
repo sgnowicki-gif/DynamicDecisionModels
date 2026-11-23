@@ -128,6 +128,7 @@ import json
 import os
 import pickle
 import tempfile
+import time
 
 FORMAT_VERSION = 3
 CHECKPOINT_FILENAME = "checkpoint.pkl"
@@ -428,7 +429,16 @@ def save_checkpoint(output_dir, state):
     try:
         with os.fdopen(fd, "wb") as fh:
             pickle.dump(state, fh, protocol=pickle.HIGHEST_PROTOCOL)
-        os.replace(tmp_path, path)
+        # Same Windows WinError 32 race as in session_store.put:
+        # retry the atomic replace instead of crashing the run.
+        for _attempt in range(10):
+            try:
+                os.replace(tmp_path, path)
+                break
+            except PermissionError:
+                if _attempt == 9:
+                    raise
+                time.sleep(0.25)
     except BaseException:
         try:
             os.unlink(tmp_path)

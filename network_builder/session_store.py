@@ -49,6 +49,7 @@ import os
 import pickle
 import shutil
 import tempfile
+import time
 
 SESSIONS_DIRNAME = "sessions"
 
@@ -86,7 +87,19 @@ class SessionStore:
                 with os.fdopen(fd, "wb") as fh:
                     pickle.dump(session, fh,
                                 protocol=pickle.HIGHEST_PROTOCOL)
-                os.replace(tmp_path, path)
+                # Windows (WinError 32): another process -- usually
+                # antivirus / indexer -- can hold the just-written
+                # temp file open for a moment, and os.replace then
+                # fails. The file is fully written and closed here,
+                # so retry a few times instead of crashing the run.
+                for _attempt in range(10):
+                    try:
+                        os.replace(tmp_path, path)
+                        break
+                    except PermissionError:
+                        if _attempt == 9:
+                            raise
+                        time.sleep(0.25)
             except BaseException:
                 try:
                     os.unlink(tmp_path)
