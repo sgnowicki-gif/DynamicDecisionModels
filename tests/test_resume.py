@@ -69,11 +69,12 @@ def example_setup():
     return projects, demand, groups, group_coords
 
 
-def expect_value_error(name, fn):
+def expect_value_error(name, fn, needle=None):
     try:
         fn()
     except ValueError as exc:
-        check(name, True, "ValueError: %s" % (exc,))
+        check(name, needle is None or needle in str(exc),
+              "ValueError: %s" % (exc,))
         return
     raise AssertionError("FAIL %s: no ValueError raised" % name)
 
@@ -580,7 +581,17 @@ def main():
     max_group = max(n["group_id"] for n in state4["nodes"])
     bad_group = dict(state4)
     bad_group["next_group_id"] = max_group  # must EXCEED it
-    bad_path4 = write_tmp("", suffix=".pkl")
+    # The crafted checkpoint must sit next to a real
+    # sessions/ dir: written to a bare tmp file it has no
+    # sessions/ alongside, so the v3.2 fail-fast pinned-file
+    # check fires first and the next_group_id guard is never
+    # reached. Copy out_a's sessions/ next to it, so the
+    # guard is what fails -- and assert on the message, so
+    # the check fails if the guard is removed.
+    out_9 = tempfile.mkdtemp(prefix="resume_9_")
+    shutil.copytree(os.path.join(out_a, "sessions"),
+                    os.path.join(out_9, "sessions"))
+    bad_path4 = os.path.join(out_9, "checkpoint.pkl")
     with open(bad_path4, "wb") as fh:
         pickle.dump(bad_group, fh)
     expect_value_error(
@@ -588,7 +599,8 @@ def main():
         lambda: build_network(
             NET, projects, demand, groups, START_DATE, horizon=6,
             output_dir=tempfile.mkdtemp(), coords=group_coords,
-            profiles=OVERRIDE, resume_from=bad_path4))
+            profiles=OVERRIDE, resume_from=bad_path4),
+        needle="next_group_id")
 
     # (9b) A v2 checkpoint (format_version 2) fails loud: v2
     # sessions carry MOE history and embed sessions inline, so

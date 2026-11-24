@@ -20,6 +20,20 @@ engine flags (moe_removed, sessions_spilled, path_cache,
 worker_prune), so resuming with a different engine setting
 fails loud instead of silently mixing.
 
+v3.2 keeps FORMAT_VERSION 3. The only format change is an
+extra OPTIONAL entry in "session_store": "pinned", the
+sorted list of session keys pinned by this checkpoint (the
+frontier nodes' traffic keys; see session_store.py). A v3
+checkpoint without "pinned" still loads: restore pins its
+refcount keys, which are exactly its frontier keys, so v3
+checkpoints remain loadable and resume with the same
+crash protection as v3.2 ones. No checkpoint.prev.pkl is
+kept: the single-checkpoint design (and the existing
+tests that assert exactly one .pkl in the output dir)
+stands, and pinning makes the one checkpoint resumable
+after a mid-layer crash, which is what a second copy
+would have been for.
+
 What a checkpoint contains (minimum to restart exactly):
 frontier traffic sessions ONLY -- in v3, the session KEY of
 each node at the completed epoch (the session itself lives
@@ -490,6 +504,16 @@ def load_checkpoint(path):
             or "refcounts" not in state["session_store"]:
         raise ValueError("checkpoint file %s has a bad session_store "
                          "state" % path)
+    # v3.2: "pinned" is optional (v3 checkpoints have none)
+    # but, when present, must be a list of integer keys.
+    pinned = state["session_store"].get("pinned")
+    if pinned is not None and (
+            not isinstance(pinned, list)
+            or any(not isinstance(key, int)
+                   or isinstance(key, bool) or key < 1
+                   for key in pinned)):
+        raise ValueError("checkpoint file %s has a bad session_store "
+                         "pinned set %r" % (path, pinned))
     if not isinstance(state["epoch"], int) \
             or isinstance(state["epoch"], bool):
         raise ValueError("checkpoint file %s has a bad epoch %r"

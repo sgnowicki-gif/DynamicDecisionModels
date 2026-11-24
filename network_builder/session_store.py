@@ -35,13 +35,35 @@ they handed in. The two backends share the reference-count
 logic, so one code path serves both.
 
 Resume. The checkpoint stores {"next_key": int, "refcounts":
-{key: node_refs}} (see checkpoint.py). restore_state rebuilds
-the counts; sweep_orphans deletes sess files the restored
-state does not reference (orphans from a layer that was
-killed mid-write). When a run resumes into a DIFFERENT
-output dir than the checkpoint's, build_network copies the
-checkpoint's sessions/ directory into the new output dir
-first, so the resumed run owns its files.
+{key: node_refs}, "pinned": [key, ...]} (see checkpoint.py).
+restore_state rebuilds the counts and the pin set;
+sweep_orphans deletes sess files the restored state does not
+reference (orphans from a layer that was killed mid-write).
+When a run resumes into a DIFFERENT output dir than the
+checkpoint's, build_network copies the checkpoint's
+sessions/ directory into the new output dir first, so the
+resumed run owns its files.
+
+Pinning (v3.2). A node's session file must survive until the
+next checkpoint stops referencing it. The bug v3.2 fixes:
+after a node was expanded, release() deleted its file as
+soon as the refcount hit zero -- but the checkpoint written
+at the previous layer boundary still listed that node, so a
+crash mid-layer left the checkpoint pointing at deleted
+files and the resume died later at load_traffic. The store
+therefore keeps a pinned set: the traffic keys of the nodes
+in the latest checkpoint. release(), cache_release() and
+sweep_orphans() NEVER delete a pinned file (refcounts still
+decrement, and a pinned key whose count reaches zero keeps
+its entry at zero so the file stays loadable). The pin set
+is updated when a new checkpoint is saved and persisted in
+the checkpoint's session_store state, so a second mid-layer
+crash is resumable too; the sweep after each checkpoint
+save deletes files that are unpinned AND unreferenced, so
+disk stays bounded to roughly two layers' sessions. A
+checkpoint written by v3 (no "pinned" entry) restores with
+its refcount keys pinned, which are exactly its frontier
+keys, so v3 checkpoints stay loadable and protected.
 """
 
 import copy
@@ -65,6 +87,11 @@ class SessionStore:
         self._refcounts = {}
         self._cache_refs = {}
         self._memory = {}
+        # v3.2: keys pinned by the latest checkpoint (see the
+        # module docstring). A pinned file is never deleted by
+        # release(), cache_release() or sweep_orphans(), even
+        # at zero references.
+        self._pinned = set()
 
     def _path(self, key):
         return os.path.join(self.directory, "sess_%d.pkl" % key)
@@ -133,6 +160,47 @@ class SessionStore:
     def has(self, key):
         return key in self._refcounts
 
+    def file_exists(self, key):
+        """True when the session for key is actually on disk
+        (or in memory for the memory backend). Resume
+        validation uses this, not has(): has() only checks
+        the refcount dict, which says nothing about whether
+        the file survived a crash."""
+        if key not in self._refcounts:
+            return False
+        if self.directory is None:
+            return key in self._memory
+        return os.path.isfile(self._path(key))
+
+    def session_path(self, key):
+        """Disk path of the session file, or None for the
+        memory backend. Used in resume-failure messages."""
+        if self.directory is None:
+            return None
+        return self._path(key)
+
+    def pinned_keys(self):
+        """Sorted list of the keys pinned by the latest
+        checkpoint (v3.2)."""
+        return sorted(self._pinned)
+
+    def set_pinned(self, keys):
+        """Replace the pin set with the given keys.
+
+        Called when a new checkpoint is saved, with the
+        traffic keys of the new frontier nodes. This alone
+        deletes nothing: the caller sweeps afterwards, so
+        files that are now unpinned AND unreferenced get
+        deleted then."""
+        pinned = set()
+        for key in keys:
+            if not isinstance(key, int) or isinstance(key, bool) \
+                    or key < 1:
+                raise ValueError(
+                    "session store: bad pinned key %r" % (key,))
+            pinned.add(key)
+        self._pinned = pinned
+
     def add_ref(self, key):
         if key not in self._refcounts:
             raise ValueError(
@@ -140,7 +208,17 @@ class SessionStore:
         self._refcounts[key] += 1
 
     def release(self, key):
-        """Drop one reference; delete the file at zero references."""
+        """Drop one reference; delete the file at zero references.
+
+        v3.2: a PINNED key is never deleted, even at zero
+        references -- its file is still named by the latest
+        checkpoint, so a crash mid-layer must be able to
+        resume from it. The count still drops to zero and
+        the entry is kept (at zero) so the file stays
+        loadable through get()/has(); the file is deleted
+        later by sweep_orphans(), once the key is unpinned
+        by a newer checkpoint and still unreferenced.
+        """
         if key not in self._refcounts:
             raise ValueError(
                 "session store: release on unknown key %r" % (key,))
@@ -149,6 +227,9 @@ class SessionStore:
             raise ValueError(
                 "session store: negative refcount for key %r" % (key,))
         if self._refcounts[key] == 0:
+            if key in self._pinned:
+                self._cache_refs.pop(key, None)
+                return
             del self._refcounts[key]
             self._cache_refs.pop(key, None)
             if self.directory is not None:
@@ -185,14 +266,19 @@ class SessionStore:
         Cache references are excluded: the cache is dropped on
         resume, so a cache-only key records zero references
         here and its file is swept on resume. Keys with zero
-        node references are omitted.
+        node references are omitted. v3.2: the pin set is
+        recorded too ("pinned": the traffic keys of the
+        frontier nodes in this checkpoint), so a resume
+        restores the same protection against a second
+        mid-layer crash.
         """
         refs = {}
         for key, total in self._refcounts.items():
             node_refs = total - self._cache_refs.get(key, 0)
             if node_refs > 0:
                 refs[key] = node_refs
-        return {"next_key": self._next_key, "refcounts": refs}
+        return {"next_key": self._next_key, "refcounts": refs,
+                "pinned": sorted(self._pinned)}
 
     def restore_state(self, state):
         """Restore counts from a checkpoint state dict."""
@@ -219,8 +305,35 @@ class SessionStore:
                     "session store state has a bad refcount for key "
                     "%r: %r" % (raw_key, count))
             restored[key] = count
+        # v3.2: restore the pin set. A v3 checkpoint has no
+        # "pinned" entry; its refcount keys ARE its frontier
+        # keys, so pin those -- a v3 checkpoint resumes with
+        # the same protection as a v3.2 one. A pinned key
+        # missing from refcounts (it can only be at zero
+        # references) is re-added at zero so its file stays
+        # loadable through get().
+        raw_pinned = state.get("pinned")
+        if raw_pinned is None:
+            pinned = set(restored)
+        else:
+            if not isinstance(raw_pinned, (list, tuple)):
+                raise ValueError(
+                    "session store state has a bad pinned set %r"
+                    % (raw_pinned,))
+            pinned = set()
+            for raw_key in raw_pinned:
+                if not isinstance(raw_key, int) \
+                        or isinstance(raw_key, bool) or raw_key < 1:
+                    raise ValueError(
+                        "session store state has a bad pinned key "
+                        "%r" % (raw_key,))
+                pinned.add(raw_key)
+        for key in pinned:
+            if key not in restored:
+                restored[key] = 0
         self._next_key = next_key
         self._refcounts = restored
+        self._pinned = pinned
         self._cache_refs = {}
         if self.directory is None:
             # A memory-backend store cannot be restored from a
@@ -230,12 +343,18 @@ class SessionStore:
                 "an in-memory store (resume needs an output_dir)")
 
     def sweep_orphans(self):
-        """Delete sess files no restored reference points at.
+        """Delete sess files no live reference or pin points at.
 
         Disk backend only. Orphans come from a layer killed
         mid-write: keys at or past next_key, or keys whose
         references were all released, never get reused, so the
-        files are dead weight. Returns the number deleted.
+        files are dead weight. v3.2: a file is deleted only
+        when it is BOTH unpinned and unreferenced -- a pinned
+        key keeps its file even at zero references (its entry
+        is kept at zero by release(), so it is found here and
+        skipped), and a zero-reference unpinned entry is
+        removed from the counts as its file is deleted.
+        Returns the number deleted.
         """
         if self.directory is None:
             return 0
@@ -248,12 +367,17 @@ class SessionStore:
                 key = int(name[len("sess_"):-len(".pkl")])
             except ValueError:
                 continue
-            if key not in self._refcounts:
+            if key in self._pinned:
+                continue
+            if key not in self._refcounts \
+                    or self._refcounts[key] == 0:
                 try:
                     os.unlink(os.path.join(self.directory, name))
                     deleted += 1
                 except OSError:
                     pass
+                self._refcounts.pop(key, None)
+                self._cache_refs.pop(key, None)
         return deleted
 
     def copy_from(self, source_dir):

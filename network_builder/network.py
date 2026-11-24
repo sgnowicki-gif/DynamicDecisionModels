@@ -679,6 +679,22 @@ def build_network(network_dir, projects, demand, groups, start_date,
         swept = store.sweep_orphans()
         if verbose and swept:
             print("swept %d orphan spilled session files" % swept)
+        # v3.2: fail fast when a session file the checkpoint
+        # needs is gone from disk. The old check (store.has,
+        # i.e. the refcount dict) could not see this: a
+        # mid-layer crash in v3 deleted frontier files whose
+        # keys were still in the refcounts, so the resume
+        # failed later, mid-run, at load_traffic instead of
+        # here. With pinning the files should be present; if
+        # one is missing anyway (hand-deleted, a v3 crash
+        # before the fix), say so now and refuse to resume.
+        for key in store.pinned_keys():
+            if not store.file_exists(key):
+                raise ValueError(
+                    "checkpoint pins session key %r but its file "
+                    "is missing on disk (%s): the checkpoint "
+                    "cannot be resumed -- restart fresh"
+                    % (key, store.session_path(key)))
         if state["fingerprint"] != fingerprint:
             raise ValueError(
                 "checkpoint fingerprint mismatch: the checkpoint "
@@ -721,6 +737,17 @@ def build_network(network_dir, projects, demand, groups, start_date,
                     "which is not in the session store (sessions/ "
                     "directory incomplete?)"
                     % (record["node_id"], record["traffic_key"]))
+            # v3.2: the key being known is not enough -- the
+            # FILE must be there (see the pinned check above).
+            if record["traffic_key"] is not None and \
+                    not store.file_exists(record["traffic_key"]):
+                raise ValueError(
+                    "checkpoint node %r references session key %r, "
+                    "whose session file is missing on disk (%s): "
+                    "the run was killed mid-layer after that "
+                    "session was released -- restart fresh"
+                    % (record["node_id"], record["traffic_key"],
+                       store.session_path(record["traffic_key"])))
             if record["epoch"] > state["epoch"]:
                 raise ValueError(
                     "checkpoint node %r is at epoch %d, past the "
@@ -1022,6 +1049,17 @@ def build_network(network_dir, projects, demand, groups, start_date,
             # uninterrupted run and the wall-clock reporting
             # counters (transition_seconds, transition_log
             # seconds) always differ.
+            # v3.2: pin this checkpoint's frontier BEFORE the
+            # state is built, so the pin set is persisted in
+            # the checkpoint itself; then sweep, so files that
+            # are now unpinned AND unreferenced (the previous
+            # frontier, released during this layer) are deleted
+            # and disk stays bounded to roughly two layers.
+            store.set_pinned([
+                node.traffic_key
+                for node in nodes.values()
+                if node.epoch == epoch + 1
+                and node.traffic_key is not None])
             checkpoint_path = save_checkpoint(
                 output_dir,
                 build_state(epoch + 1, horizon, start_date,
@@ -1029,6 +1067,9 @@ def build_network(network_dir, projects, demand, groups, start_date,
                             next_node_id, next_link_id, next_group_id,
                             totals, layer_stats,
                             session_store_state=store.checkpoint_state()))
+            swept = store.sweep_orphans()
+            if verbose and swept:
+                print("swept %d orphan spilled session files" % swept)
             if verbose:
                 print("checkpoint %s: epoch %d, %.1f MB"
                       % (checkpoint_path, epoch + 1,

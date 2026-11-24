@@ -186,6 +186,45 @@ sklearn are never required: scipy is used for the Poisson ppf
 only when installed (a verified fallback is built in), and
 k-means is implemented in numpy (sklearn is never consulted).
 
+## What's new in v3.2
+
+v3.2 fixes one crash-resume bug and nothing else. In v3,
+expanding a node released its session file as soon as the
+refcount hit zero -- but the checkpoint written at the
+previous layer boundary still listed that node, so a crash
+mid-layer left the checkpoint pointing at deleted files
+and the resume died later at load_traffic. That is what
+happened to the v3 run: it crashed mid-layer in epoch 26,
+and the resume failed with "session file missing for key
+2868". (WinError 32 is a different failure -- the
+os.replace file-lock race the v3.1 rename retry addresses
+-- not the cause of the epoch-26 crash.) v3.2 pins every
+session file named by the latest checkpoint: SessionStore
+keeps a pinned set (the frontier nodes' traffic keys),
+release(), cache_release() and sweep_orphans() never delete
+a pinned file (refcounts still decrement), the pin set is
+persisted in the checkpoint's session_store state ("pinned")
+and restored on resume, so a second mid-layer crash is
+resumable too, and the sweep after each checkpoint save
+deletes files that are unpinned AND unreferenced, so disk
+stays bounded to roughly two layers. Resume validation now
+checks the session files actually exist on disk, not just
+the refcount dict, so a missing file fails fast at resume
+with a clear message instead of mid-run at load_traffic.
+FORMAT_VERSION stays 3: "pinned" is an optional entry, so
+v3 checkpoints remain loadable (their refcount keys are
+pinned on restore, which are exactly their frontier keys).
+No change to penalties, nodes, links, or any other file
+format. No checkpoint.prev.pkl is kept: pinning makes the
+single checkpoint resumable after a mid-layer crash, which
+is what a second copy would have been for. Because the
+deleted v3 files are unrecoverable, a run crashed this way
+restarts fresh from epoch 0 -- v3.2 does not resurrect it.
+The v3.1 os.replace retry (10 attempts, 0.25 s apart) is
+unchanged in session_store.put and checkpoint.save_checkpoint.
+The crash simulation is a shipped test:
+tests/test_crash_resume.py.
+
 ## Quick start (synthetic example)
 
 Extract this zip into a clean directory, then from that
